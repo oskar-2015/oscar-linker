@@ -1,8 +1,6 @@
 package com.oscar.linker
 
 import android.annotation.SuppressLint
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
@@ -52,7 +50,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSave: Button
     private lateinit var btnToggle: Button
     private lateinit var btnUnlink: Button
-    private lateinit var btnDebug: Button
 
     private var currentTab = "settings"
     private var linkingMode = false
@@ -61,9 +58,7 @@ class MainActivity : AppCompatActivity() {
     private var isLinked = false
     private var statsHandler: Handler? = null
     private var successShown = false
-    private var successLock = false  // يمنع أي طلب بعد النجاح
-    private val capturedFrames = mutableListOf<String>()
-    private val capturedSsids = mutableListOf<String>()
+    private var successLock = false
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -73,31 +68,15 @@ class MainActivity : AppCompatActivity() {
     private val BASE_URL = "https://signal-bott.onrender.com"
     private val QX_DOMAIN = "https://quotex.com"
 
+    // سكربت التقاط SSID
     private val EARLY_HOOK_JS = """
     (function() {
         if (window.__oscarEarlyHook) return;
         window.__oscarEarlyHook = true;
-        window.__oscarFrames = [];
-
         function extractAndSend(text, tag) {
             try {
                 if (typeof text !== 'string' || text.length < 5) return;
-                if (window.__oscarFrames.length < 200) {
-                    window.__oscarFrames.push('[' + tag + '] ' + text.substring(0, 3000));
-                }
-                if (window.OscarBridge && window.OscarBridge.onFrame) {
-                    window.OscarBridge.onFrame('[' + tag + '] ' + text.substring(0, 3000));
-                }
-                var pats = [
-                    /"session"\s*:\s*"([^"]+)"/,
-                    /"token"\s*:\s*"([^"]+)"/,
-                    /"ssid"\s*:\s*"([^"]+)"/,
-                    /"authorization"\s*:\s*"([^"]+)"/,
-                    /"access_token"\s*:\s*"([^"]+)"/,
-                    /"jwt"\s*:\s*"([^"]+)"/,
-                    /session=([A-Za-z0-9_\-\.]{30,})/,
-                    /token=([A-Za-z0-9_\-\.]{30,})/
-                ];
+                var pats = [ /"session"\s*:\s*"([^"]+)"/, /"token"\s*:\s*"([^"]+)"/, /"ssid"\s*:\s*"([^"]+)"/ ];
                 for (var i = 0; i < pats.length; i++) {
                     var m = text.match(pats[i]);
                     if (m && m[1] && m[1].length > 25) {
@@ -108,51 +87,16 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch(e) {}
         }
-
-        function processIncoming(d) {
-            try {
-                if (typeof d === 'string') { extractAndSend(d, 'WS_RECV'); return; }
-                if (d instanceof Blob) { d.text().then(function(t){ extractAndSend(t, 'WS_RECV'); }); return; }
-                if (d instanceof ArrayBuffer) {
-                    try {
-                        var txt = new TextDecoder('utf-8').decode(d);
-                        extractAndSend(txt, 'WS_RECV');
-                    } catch(e) {
-                        var bytes = new Uint8Array(d);
-                        var s = '';
-                        for (var i = 0; i < bytes.length && i < 3000; i++) s += String.fromCharCode(bytes[i]);
-                        extractAndSend(s, 'WS_RECV');
-                    }
-                }
-            } catch(e) {}
-        }
-
         var OWS = window.WebSocket;
         if (OWS) {
             var HookedWS = function(url, protocols) {
-                try {
-                    if (url && window.OscarBridge && window.OscarBridge.onFrame) {
-                        window.OscarBridge.onFrame('[WS_URL] ' + url.substring(0, 500));
-                    }
-                    if (url) {
-                        var upats = [/[?&]token=([^&]+)/, /[?&]session=([^&]+)/, /[?&]ssid=([^&]+)/];
-                        for (var i = 0; i < upats.length; i++) {
-                            var um = url.match(upats[i]);
-                            if (um && um[1] && um[1].length > 25) {
-                                if (window.OscarBridge && window.OscarBridge.onSsid) {
-                                    window.OscarBridge.onSsid(decodeURIComponent(um[1]));
-                                }
-                            }
-                        }
-                    }
-                } catch(e){}
                 var ws = protocols ? new OWS(url, protocols) : new OWS(url);
                 try {
                     var origAdd = ws.addEventListener.bind(ws);
                     ws.addEventListener = function(type, listener, opts) {
                         if (type === 'message') {
                             return origAdd(type, function(ev) {
-                                processIncoming(ev.data);
+                                if (typeof ev.data === 'string') extractAndSend(ev.data, 'WS_RECV');
                                 return listener(ev);
                             }, opts);
                         }
@@ -167,50 +111,11 @@ class MainActivity : AppCompatActivity() {
             HookedWS.CLOSING = OWS.CLOSING; HookedWS.CLOSED = OWS.CLOSED;
             window.WebSocket = HookedWS;
         }
-
         if (window.WebSocket && window.WebSocket.prototype && window.WebSocket.prototype.send) {
             var origSend = window.WebSocket.prototype.send;
             window.WebSocket.prototype.send = function(data) {
-                try {
-                    if (typeof data === 'string') {
-                        extractAndSend(data, 'WS_SEND');
-                    }
-                } catch(e){}
+                if (typeof data === 'string') extractAndSend(data, 'WS_SEND');
                 return origSend.apply(this, arguments);
-            };
-        }
-
-        var origFetch = window.fetch;
-        if (origFetch) {
-            window.fetch = function() {
-                try {
-                    var args = arguments;
-                    if (args[1] && args[1].headers) {
-                        var h = args[1].headers;
-                        var authHeader = h['Authorization'] || h['authorization'];
-                        if (authHeader && authHeader.length > 25 && window.OscarBridge) {
-                            var tok = authHeader.replace(/^Bearer\s+/i, '');
-                            if (tok.length > 25) window.OscarBridge.onSsid(tok);
-                        }
-                    }
-                } catch(e){}
-                return origFetch.apply(this, arguments);
-            };
-        }
-
-        var OrigXHR = window.XMLHttpRequest;
-        if (OrigXHR) {
-            var origSetHeader = OrigXHR.prototype.setRequestHeader;
-            OrigXHR.prototype.setRequestHeader = function(name, value) {
-                try {
-                    if (name && name.toLowerCase() === 'authorization' && value && value.length > 25) {
-                        if (window.OscarBridge) {
-                            var tok = value.replace(/^Bearer\s+/i, '');
-                            if (tok.length > 25) window.OscarBridge.onSsid(tok);
-                        }
-                    }
-                } catch(e){}
-                return origSetHeader.apply(this, arguments);
             };
         }
     })();
@@ -220,36 +125,111 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("oscar_prefs", Context.MODE_PRIVATE)
         val saved = prefs.getString("license_key", null)
-        if (saved.isNullOrBlank()) showKeyDialog()
-        else { licenseKey = saved; setupUi(); showSettings() }
+        
+        if (saved.isNullOrBlank()) {
+            showKeyDialog()
+        } else {
+            licenseKey = saved
+            // التحقق من المفتاح المحفوظ قبل فتح التطبيق
+            validateKey(key = saved, onResult = { ok, err ->
+                if (ok) {
+                    setupUi()
+                    showSettings()
+                } else {
+                    prefs.edit().remove("license_key").apply()
+                    Toast.makeText(this, "❌ $err", Toast.LENGTH_LONG).show()
+                    showKeyDialog()
+                }
+            })
+        }
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // 🔑 نافذة إدخال المفتاح (مع التحقق)
+    // ═══════════════════════════════════════════════════════════
     private fun showKeyDialog() {
-        val input = EditText(this).apply { hint = "OSCAR-XXXX-XXXX-XXXX"; setSingleLine() }
-        AlertDialog.Builder(this)
-            .setTitle("🔑 أدخل مفتاح التفعيل")
-            .setMessage("ضع مفتاح OSCAR الخاص بك")
-            .setView(input)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(50, 30, 50, 10)
+        }
+        
+        val input = EditText(this).apply {
+            hint = "OSCAR-XXXX-XXXX-XXXX"
+            setSingleLine()
+            setTextColor(Color.BLACK)
+            textSize = 16f
+            gravity = Gravity.CENTER
+        }
+        container.addView(input)
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("🔑 تفعيل الحساب")
+            .setMessage("يرجى إدخال مفتاح OSCAR الخاص بك")
+            .setView(container)
             .setCancelable(false)
-            .setPositiveButton("متابعة") { _, _ ->
-                val k = input.text.toString().trim().uppercase()
-                if (k.isEmpty()) { finish(); return@setPositiveButton }
-                licenseKey = k
-                prefs.edit().putString("license_key", k).apply()
-                setupUi()
-                showSettings()
-            }
             .setNegativeButton("إلغاء") { _, _ -> finish() }
-            .show()
+            .setPositiveButton("متابعة", null) // set null to override
+            .create()
+
+        dialog.setOnShowListener {
+            val btn = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            btn.setOnClickListener {
+                val k = input.text.toString().trim().uppercase()
+                if (k.isEmpty()) {
+                    Toast.makeText(this, "الرجاء إدخال المفتاح", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                
+                btn.isEnabled = false
+                btn.text = "جاري التحقق..."
+                
+                validateKey(key = k, onResult = { ok, err ->
+                    if (ok) {
+                        licenseKey = k
+                        prefs.edit().putString("license_key", k).apply()
+                        dialog.dismiss()
+                        setupUi()
+                        showSettings()
+                    } else {
+                        btn.isEnabled = true
+                        btn.text = "متابعة"
+                        Toast.makeText(this, "❌ $err", Toast.LENGTH_LONG).show()
+                    }
+                })
+            }
+        }
+        dialog.show()
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // 🌐 التحقق من صحة المفتاح عبر السيرفر
+    // ═══════════════════════════════════════════════════════════
+    private fun validateKey(key: String, onResult: (Boolean, String) -> Unit) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val req = Request.Builder().url("$BASE_URL/api/app/user_info/$key").build()
+                val res = client.newCall(req).execute()
+                val json = JSONObject(res.body?.string() ?: "{}")
+                val ok = json.optBoolean("ok")
+                val err = json.optString("error", "المفتاح غير صالح، معطل، أو منتهي")
+                withContext(Dispatchers.Main) { onResult(ok, err) }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { onResult(false, "خطأ اتصال: ${e.message}") }
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 🎨 الواجهة الرئيسية
+    // ═══════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupUi() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         statusBar = TextView(this).apply {
             text = "📊 الإعدادات"
-            textSize = 14f
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#1a1a1a"))
             setPadding(30, 25, 30, 25)
@@ -277,17 +257,29 @@ class MainActivity : AppCompatActivity() {
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.parseColor("#0d0d0d"))
+            setPadding(10, 10, 10, 10)
         }
+        
         btnSettings = Button(this).apply {
             text = "📊 الإعدادات"
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(5, 0, 5, 0)
+            }
             setOnClickListener { showSettings() }
         }
+        
         btnMarket = Button(this).apply {
             text = "📈 السوق"
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(5, 0, 5, 0)
+            }
             setOnClickListener { showMarket() }
         }
+        
         bottomBar.addView(btnSettings)
         bottomBar.addView(btnMarket)
 
@@ -302,13 +294,15 @@ class MainActivity : AppCompatActivity() {
         val sv = ScrollView(this)
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(30, 30, 30, 30)
+            setPadding(40, 40, 40, 40)
             setBackgroundColor(Color.parseColor("#0a0a0a"))
         }
 
+        // حالة الربط
         tvLinkStatus = TextView(this).apply {
             text = "⏳ جاري التحميل..."
-            textSize = 16f
+            textSize = 18f
+            setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             setPadding(30, 40, 30, 40)
@@ -316,11 +310,17 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(tvLinkStatus)
 
+        // زر الربط
         btnLink = Button(this).apply {
             text = "🔗 ربط حساب Quotex"
             visibility = android.view.View.GONE
             setBackgroundColor(Color.parseColor("#d4af37"))
             setTextColor(Color.BLACK)
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, 20, 0, 20)
+            }
             setPadding(20, 30, 20, 30)
         }
         btnLink.setOnClickListener {
@@ -333,23 +333,27 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(btnLink)
 
+        // الرصيد
         tvBalance = TextView(this).apply {
             text = "الرصيد: —"
-            textSize = 15f
+            textSize = 18f
+            setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#d4af37"))
             gravity = Gravity.CENTER
             setPadding(0, 30, 0, 10)
         }
         layout.addView(tvBalance)
+        
         tvPL = TextView(this).apply {
             text = "الربح/الخسارة: —"
-            textSize = 15f
+            textSize = 16f
             setTextColor(Color.GRAY)
             gravity = Gravity.CENTER
             setPadding(0, 0, 0, 30)
         }
         layout.addView(tvPL)
 
+        // إعدادات التداول
         layout.addView(makeLabel("نوع الحساب:"))
         spinnerAccount = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity,
@@ -387,10 +391,16 @@ class MainActivity : AppCompatActivity() {
         etStopProfit = makeNumberInput("0")
         layout.addView(etStopProfit)
 
+        // الأزرار (مفصولة)
         btnSave = Button(this).apply {
             text = "💾 حفظ الإعدادات"
             setBackgroundColor(Color.parseColor("#d4af37"))
             setTextColor(Color.BLACK)
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, 30, 0, 20)
+            }
             setPadding(20, 30, 20, 30)
             setOnClickListener { saveSettings() }
         }
@@ -400,6 +410,11 @@ class MainActivity : AppCompatActivity() {
             text = "▶️ تفعيل التداول الآلي"
             setBackgroundColor(Color.parseColor("#2e7d32"))
             setTextColor(Color.WHITE)
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, 10, 0, 20)
+            }
             setPadding(20, 30, 20, 30)
             visibility = android.view.View.GONE
             setOnClickListener { toggleCopy() }
@@ -410,20 +425,16 @@ class MainActivity : AppCompatActivity() {
             text = "🔌 فصل الحساب"
             setBackgroundColor(Color.parseColor("#c62828"))
             setTextColor(Color.WHITE)
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, 10, 0, 30)
+            }
             setPadding(20, 30, 20, 30)
             visibility = android.view.View.GONE
             setOnClickListener { unlinkAccount() }
         }
         layout.addView(btnUnlink)
-
-        btnDebug = Button(this).apply {
-            text = "🔍 تشخيص (frames / cookies)"
-            setBackgroundColor(Color.parseColor("#333333"))
-            setTextColor(Color.parseColor("#d4af37"))
-            setPadding(20, 20, 20, 20)
-            setOnClickListener { showDebugInfo() }
-        }
-        layout.addView(btnDebug)
 
         sv.addView(layout)
         return sv
@@ -431,9 +442,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun makeLabel(txt: String): TextView = TextView(this).apply {
         text = txt
-        textSize = 14f
+        textSize = 15f
         setTextColor(Color.parseColor("#d4af37"))
-        setPadding(0, 25, 0, 8)
+        setPadding(0, 30, 0, 10)
         setTypeface(null, Typeface.BOLD)
     }
 
@@ -441,8 +452,12 @@ class MainActivity : AppCompatActivity() {
         inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
         setText(default)
         setTextColor(Color.WHITE)
+        textSize = 16f
         setBackgroundColor(Color.parseColor("#1a1a1a"))
-        setPadding(20, 25, 20, 25)
+        setPadding(30, 30, 30, 30)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            setMargins(0, 0, 0, 15)
+        }
     }
 
     private fun updateHints() {
@@ -477,8 +492,6 @@ class MainActivity : AppCompatActivity() {
         linkingMode = true
         successShown = false
         successLock = false
-        capturedFrames.clear()
-        capturedSsids.clear()
         if (webView.url == null || !webView.url!!.contains("quotex.com")) {
             webView.loadUrl("$QX_DOMAIN/ar/trade")
         }
@@ -674,31 +687,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showDebugInfo() {
-        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: "(none)"
-        val sb = StringBuilder()
-        sb.append("=== CAPTURED SSIDs (${capturedSsids.size}) ===\n")
-        capturedSsids.take(10).forEach { sb.append("• ${it.take(100)}\n") }
-        sb.append("\n=== CAPTURED FRAMES (${capturedFrames.size}) ===\n")
-        capturedFrames.take(20).forEachIndexed { i, f ->
-            sb.append("[${i+1}] ${f.take(400)}\n\n")
-        }
-        sb.append("\n=== COOKIES ===\n")
-        sb.append(cookies.take(2000))
-
-        val full = sb.toString()
-        AlertDialog.Builder(this)
-            .setTitle("🔍 تشخيص")
-            .setMessage(full)
-            .setPositiveButton("نسخ") { _, _ ->
-                val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                clip.setPrimaryClip(ClipData.newPlainText("debug", full))
-                Toast.makeText(this, "تم النسخ", Toast.LENGTH_SHORT).show()
-            }
-            .setNegativeButton("إغلاق", null)
-            .show()
-    }
-
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
     private fun configureWebView() {
         webView.settings.apply {
@@ -732,10 +720,9 @@ class MainActivity : AppCompatActivity() {
                     if (linkingMode && (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard"))) {
                         if (!successLock) {
                             statusBar.text = "✅ تم اكتشاف تسجيل الدخول — جاري البحث عن SSID..."
-                            // فحص مرة واحدة بعد 15 ثانية: هل التقطنا شيئاً؟
                             Handler(Looper.getMainLooper()).postDelayed({
                                 if (linkingMode && !successShown) {
-                                    statusBar.text = "⚠️ لم نتمكن من التقاط SSID. اذهب للإعدادات، اضغط ربط، وحاول مجدداً."
+                                    statusBar.text = "⚠️ لم نتمكن من التقاط SSID. اذهب للإعدادات واضغط ربط مجدداً."
                                 }
                             }, 15000)
                         }
@@ -746,7 +733,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun sendToServer(ssid: String) {
-        // ★★★ حماية: لا ترسل بعد النجاح أو خارج وضع الربط ★★★
         if (!linkingMode || successLock) return
         if (ssid.length < 25) return
 
@@ -770,7 +756,6 @@ class MainActivity : AppCompatActivity() {
 
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
-                        // ✅ نجح
                         successLock = true
                         successShown = true
                         linkingMode = false
@@ -780,7 +765,6 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         val err = json.optString("error", "خطأ")
                         statusBar.text = "⚠️ فشل: $err"
-                        // لا نعيد المحاولة تلقائياً — ننتظر SSID آخر
                     }
                 }
             } catch (e: Exception) {
@@ -793,22 +777,12 @@ class MainActivity : AppCompatActivity() {
 
     inner class Bridge {
         @JavascriptInterface
-        fun onFrame(frame: String) {
-            Log.d("OscarWS", frame.take(500))
-            if (capturedFrames.size < 200) capturedFrames.add(frame)
-        }
-
-        @JavascriptInterface
         fun onSsid(ssid: String) {
             if (ssid.length < 25) return
-            if (ssid !in capturedSsids) {
-                capturedSsids.add(ssid)
-                Log.d("OscarSSID", "Captured: ${ssid.take(100)}")
-                runOnUiThread {
-                    if (linkingMode && !successLock) {
-                        statusBar.text = "🎯 تم التقاط SSID! (${ssid.length} حرف)"
-                        sendToServer(ssid)
-                    }
+            runOnUiThread {
+                if (linkingMode && !successLock) {
+                    statusBar.text = "🎯 تم التقاط SSID! (${ssid.length} حرف)"
+                    sendToServer(ssid)
                 }
             }
         }
