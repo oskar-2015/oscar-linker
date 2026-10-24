@@ -41,7 +41,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvPL: TextView
     private lateinit var btnLink: Button
     
-    // إعدادات
     private lateinit var spinnerAccount: Spinner
     private lateinit var spinnerMode: Spinner
     private lateinit var etTradeValue: EditText
@@ -51,7 +50,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvLossHint: TextView
     private lateinit var tvProfitHint: TextView
     
-    // أزرار التشغيل
     private lateinit var btnEnableCopy: Button
     private lateinit var btnEnableAuto: Button
     private lateinit var btnStop: Button
@@ -289,7 +287,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun createSettingsView(): ScrollView {
         val sv = ScrollView(this)
-        // خلفية متدرجة للاعدادات
         val bgDrawable = GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
             intArrayOf(Color.parseColor("#0a0a0a"), Color.parseColor("#151515"), Color.parseColor("#0a0a0a"))
@@ -382,7 +379,6 @@ class MainActivity : AppCompatActivity() {
         etStopProfit = makeNumberInput("0")
         layout.addView(etStopProfit)
 
-        // زر تفعيل النسخ (Copy Trading)
         btnEnableCopy = Button(this).apply {
             text = "👥 تفعيل النسخ (Copy Trading)"
             setBackgroundColor(Color.parseColor("#d4af37"))
@@ -395,7 +391,6 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(btnEnableCopy)
 
-        // زر تفعيل التداول الآلي (Auto-Trading)
         btnEnableAuto = Button(this).apply {
             text = "🤖 تفعيل التداول الآلي (Auto)"
             setBackgroundColor(Color.parseColor("#2e7d32"))
@@ -408,7 +403,6 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(btnEnableAuto)
 
-        // زر إيقاف التشغيل (يظهر فقط عند التفعيل)
         btnStop = Button(this).apply {
             text = "⏸️ إيقاف التداول والنسخ"
             setBackgroundColor(Color.parseColor("#c62828"))
@@ -422,7 +416,6 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(btnStop)
 
-        // زر فصل الحساب
         btnUnlink = Button(this).apply {
             text = "🔌 فصل الحساب"
             setBackgroundColor(Color.parseColor("#333333"))
@@ -492,9 +485,8 @@ class MainActivity : AppCompatActivity() {
         linkingMode = true
         successShown = false
         successLock = false
-        if (webView.url == null || !webView.url!!.contains("quotex.com")) {
-            webView.loadUrl("$QX_DOMAIN/ar/trade")
-        }
+        // تحميل الصفحة إذا لم تكن محملة، أو إعادة تحميلها إذا أردنا التقاط جلسة جديدة
+        webView.loadUrl("$QX_DOMAIN/ar/trade")
     }
 
     private fun updateTabButtons() {
@@ -628,7 +620,7 @@ class MainActivity : AppCompatActivity() {
     private fun unlinkAccount() {
         AlertDialog.Builder(this)
             .setTitle("فصل الحساب")
-            .setMessage("سيتم مسح الجلسة. متأكد؟")
+            .setMessage("سيتم مسح الجلسة وتسجيل الخروج من المتصفح. متأكد؟")
             .setPositiveButton("نعم") { _, _ ->
                 CoroutineScope(Dispatchers.IO).launch {
                     try {
@@ -637,8 +629,25 @@ class MainActivity : AppCompatActivity() {
                             .post("{}".toRequestBody("application/json".toMediaType()))
                             .build()
                         client.newCall(req).execute()
-                        withContext(Dispatchers.Main) { fetchUserInfo() }
-                    } catch (e: Exception) {}
+                        
+                        withContext(Dispatchers.Main) {
+                            // مسح الكوكيز والذاكرة المؤقتة للمتصفح بالكامل
+                            val cookieManager = CookieManager.getInstance()
+                            cookieManager.removeAllCookies(null)
+                            cookieManager.flush()
+                            webView.clearCache(true)
+                            webView.clearHistory()
+                            webView.loadUrl("about:blank")
+                            
+                            playSound(true)
+                            fetchUserInfo()
+                            Toast.makeText(this@MainActivity, "تم فصل الحساب ومسح الجلسة", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(this@MainActivity, "حدث خطأ: ${e.message}", Toast.LENGTH_SHORT).show()
+                        }
+                    }
                 }
             }
             .setNegativeButton("إلغاء", null)
