@@ -6,8 +6,8 @@
 
     <application
         android:allowBackup="true"
-        android:icon="@android:drawable/sym_def_app_icon"
-        android:label="Oscar Linker"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Oskarix"
         android:usesCleartextTraffic="false"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
