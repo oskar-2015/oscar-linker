@@ -19,6 +19,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -61,9 +62,10 @@ class MainActivity : AppCompatActivity() {
     private var statsHandler: Handler? = null
     private var isProcessingSSID = false
     private var isNotificationShowing = false
+    private var isShowingKeyDialog = false
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(45, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .build()
 
@@ -129,7 +131,8 @@ class MainActivity : AppCompatActivity() {
             showKeyDialog()
         } else {
             licenseKey = saved
-            validateKey(saved) { ok, err ->
+            // محاولة التحقق مع إعادة المحاولة
+            validateKeyWithRetry(saved) { ok, err ->
                 if (ok) { setupUi(); showSettings() }
                 else { kickUserOut(err) }
             }
@@ -156,6 +159,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showKeyDialog() {
+        if (isShowingKeyDialog) return
+        isShowingKeyDialog = true
+
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(50, 30, 50, 10)
@@ -178,6 +184,8 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("متابعة", null)
             .create()
 
+        dialog.setOnDismissListener { isShowingKeyDialog = false }
+
         dialog.setOnShowListener {
             val btn = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
             btn.setOnClickListener {
@@ -185,7 +193,7 @@ class MainActivity : AppCompatActivity() {
                 if (k.isEmpty()) return@setOnClickListener
                 btn.isEnabled = false
                 btn.text = "جاري التحقق..."
-                validateKey(k) { ok, err ->
+                validateKeyWithRetry(k) { ok, err ->
                     if (ok) {
                         licenseKey = k
                         prefs.edit().putString("license_key", k).apply()
@@ -203,18 +211,48 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
-    private fun validateKey(key: String, onResult: (Boolean, String) -> Unit) {
+    /**
+     * يتحقق من المفتاح مع إعادة المحاولة التلقائية عند فشل الشبكة.
+     * الفشل الحقيقي (مفتاح خاطئ) لا يعيد المحاولة.
+     */
+    private fun validateKeyWithRetry(key: String, onResult: (Boolean, String) -> Unit) {
         CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val req = Request.Builder().url("$BASE_URL/api/app/user_info/$key").build()
-                val res = client.newCall(req).execute()
-                val json = JSONObject(res.body?.string() ?: "{}")
-                val ok = json.optBoolean("ok")
-                val err = json.optString("error", "المفتاح غير صالح")
-                withContext(Dispatchers.Main) { onResult(ok, err) }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onResult(false, "خطأ اتصال: ${e.message}") }
+            var lastErr = "خطأ اتصال"
+            for (attempt in 1..3) {
+                try {
+                    val req = Request.Builder().url("$BASE_URL/api/app/user_info/$key").build()
+                    val res = client.newCall(req).execute()
+                    
+                    // 401/403 = مفتاح خاطئ فعلاً (لا نعيد المحاولة)
+                    if (res.code == 401 || res.code == 403) {
+                        val json = JSONObject(res.body?.string() ?: "{}")
+                        val err = json.optString("error", "المفتاح غير صالح، معطل، أو منتهي")
+                        withContext(Dispatchers.Main) { onResult(false, err) }
+                        return@launch
+                    }
+                    
+                    // نجاح
+                    if (res.isSuccessful) {
+                        val json = JSONObject(res.body?.string() ?: "{}")
+                        val ok = json.optBoolean("ok")
+                        val err = json.optString("error", "")
+                        withContext(Dispatchers.Main) { onResult(ok, err) }
+                        return@launch
+                    }
+                    
+                    lastErr = "خطأ من السيرفر (${res.code})"
+                } catch (e: Exception) {
+                    lastErr = e.message ?: "خطأ اتصال"
+                }
+                
+                if (attempt < 3) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "محاولة $attempt/3 فشلت، إعادة المحاولة...", Toast.LENGTH_SHORT).show()
+                    }
+                    delay(2500L * attempt)
+                }
             }
+            withContext(Dispatchers.Main) { onResult(false, "تعذر الاتصال بالخادم. تحقق من الإنترنت: $lastErr") }
         }
     }
 
@@ -314,7 +352,7 @@ class MainActivity : AppCompatActivity() {
         btnLink.setOnClickListener {
             AlertDialog.Builder(this@MainActivity)
                 .setTitle("🔗 ربط الحساب")
-                .setMessage("ستُفتح صفحة Quotex. سجّل دخولك.")
+                .setMessage("ستُفتح صفحة Quotex. سجّل دخولك، وسيتم الربط تلقائياً.")
                 .setPositiveButton("متابعة") { _, _ -> showMarket() }
                 .setNegativeButton("إلغاء", null)
                 .show()
@@ -345,7 +383,6 @@ class MainActivity : AppCompatActivity() {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("تجريبي (Demo)", "حقيقي (Live)"))
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(p: AdapterView<*>?, v: android.view.View?, pos: Int, id: Long) {
-                    // جلب رصيد الحساب المحدد فوراً
                     if (::licenseKey.isInitialized) fetchStats()
                 }
                 override fun onNothingSelected(p: AdapterView<*>?) {}
@@ -548,7 +585,6 @@ class MainActivity : AppCompatActivity() {
                         btnStop.visibility = android.view.View.GONE
                     }
 
-                    // التحقق من تعطيل المدير للتداول الآلي
                     if (!adminAutoEnabled) {
                         btnEnableAuto.isEnabled = false
                         btnEnableAuto.text = "🚫 التداول الآلي معطّل (من المدير)"
