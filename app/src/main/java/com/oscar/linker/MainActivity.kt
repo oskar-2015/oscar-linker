@@ -2,6 +2,7 @@ package com.oscar.linker
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
@@ -39,7 +40,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvBalance: TextView
     private lateinit var tvPL: TextView
     private lateinit var btnLink: Button
-    
     private lateinit var spinnerAccount: Spinner
     private lateinit var spinnerMode: Spinner
     private lateinit var etTradeValue: EditText
@@ -48,7 +48,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvValueHint: TextView
     private lateinit var tvLossHint: TextView
     private lateinit var tvProfitHint: TextView
-    
     private lateinit var btnEnableCopy: Button
     private lateinit var btnEnableAuto: Button
     private lateinit var btnStop: Button
@@ -60,7 +59,7 @@ class MainActivity : AppCompatActivity() {
     private var isLinked = false
     private var isLocked = false
     private var statsHandler: Handler? = null
-    private var isProcessingSSID = false // لمنع الإرسال المتكرر
+    private var isProcessingSSID = false
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -81,9 +80,7 @@ class MainActivity : AppCompatActivity() {
                 for (var i = 0; i < pats.length; i++) {
                     var m = text.match(pats[i]);
                     if (m && m[1] && m[1].length > 25) {
-                        if (window.OscarBridge && window.OscarBridge.onSsid) {
-                            window.OscarBridge.onSsid(m[1]);
-                        }
+                        if (window.OscarBridge && window.OscarBridge.onSsid) window.OscarBridge.onSsid(m[1]);
                     }
                 }
             } catch(e) {}
@@ -126,20 +123,33 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("oscar_prefs", Context.MODE_PRIVATE)
         val saved = prefs.getString("license_key", null)
-        
-        if (saved.isNullOrBlank()) {
-            showKeyDialog()
-        } else {
+        if (saved.isNullOrBlank()) showKeyDialog()
+        else {
             licenseKey = saved
             validateKey(saved) { ok, err ->
                 if (ok) { setupUi(); showSettings() }
-                else {
-                    prefs.edit().remove("license_key").apply()
-                    Toast.makeText(this, "❌ $err", Toast.LENGTH_LONG).show()
-                    showKeyDialog()
-                }
+                else { kickUserOut(err) }
             }
         }
+    }
+
+    private fun kickUserOut(reason: String) {
+        Toast.makeText(this, "❌ $reason", Toast.LENGTH_LONG).show()
+        prefs.edit().remove("license_key").apply()
+        try {
+            val cm = CookieManager.getInstance()
+            cm.removeAllCookies(null)
+            cm.flush()
+            if (::webView.isInitialized) {
+                webView.clearCache(true)
+                webView.clearHistory()
+                webView.loadUrl("about:blank")
+            }
+        } catch(e: Exception) {}
+        Handler(Looper.getMainLooper()).postDelayed({
+            finish()
+            startActivity(Intent(this, MainActivity::class.java))
+        }, 1500)
     }
 
     private fun showKeyDialog() {
@@ -158,7 +168,7 @@ class MainActivity : AppCompatActivity() {
 
         val dialog = AlertDialog.Builder(this)
             .setTitle("🔑 تفعيل Oskarix")
-            .setMessage("يرجى إدخال مفتاح التفعيل الخاص بك")
+            .setMessage("يرجى إدخال مفتاح التفعيل")
             .setView(container)
             .setCancelable(false)
             .setNegativeButton("إلغاء") { _, _ -> finish() }
@@ -197,7 +207,7 @@ class MainActivity : AppCompatActivity() {
                 val res = client.newCall(req).execute()
                 val json = JSONObject(res.body?.string() ?: "{}")
                 val ok = json.optBoolean("ok")
-                val err = json.optString("error", "المفتاح غير صالح، معطل، أو منتهي")
+                val err = json.optString("error", "المفتاح غير صالح")
                 withContext(Dispatchers.Main) { onResult(ok, err) }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) { onResult(false, "خطأ اتصال: ${e.message}") }
@@ -224,14 +234,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView = WebView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             visibility = android.view.View.GONE
         }
 
         settingsView = createSettingsView().apply {
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         }
 
         container.addView(webView)
@@ -242,7 +250,7 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.parseColor("#0d0d0d"))
             setPadding(10, 10, 10, 10)
         }
-        
+
         btnSettings = Button(this).apply {
             text = "📊 الإعدادات"
             textSize = 14f
@@ -250,7 +258,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(5, 0, 5, 0) }
             setOnClickListener { showSettings() }
         }
-        
+
         btnMarket = Button(this).apply {
             text = "📈 السوق"
             textSize = 14f
@@ -258,7 +266,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(5, 0, 5, 0) }
             setOnClickListener { showMarket() }
         }
-        
+
         bottomBar.addView(btnSettings)
         bottomBar.addView(btnMarket)
 
@@ -271,15 +279,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun createSettingsView(): ScrollView {
         val sv = ScrollView(this)
-        val bgDrawable = GradientDrawable(
-            GradientDrawable.Orientation.TOP_BOTTOM,
-            intArrayOf(Color.parseColor("#0a0a0a"), Color.parseColor("#151515"), Color.parseColor("#0a0a0a"))
-        )
-        
+        val bg = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(Color.parseColor("#0a0a0a"), Color.parseColor("#151515"), Color.parseColor("#0a0a0a")))
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(40, 40, 40, 40)
-            background = bgDrawable
+            background = bg
         }
 
         tvLinkStatus = TextView(this).apply {
@@ -306,7 +311,7 @@ class MainActivity : AppCompatActivity() {
         btnLink.setOnClickListener {
             AlertDialog.Builder(this@MainActivity)
                 .setTitle("🔗 ربط الحساب")
-                .setMessage("ستُفتح صفحة Quotex. سجّل دخولك، وسيتم الربط تلقائياً.")
+                .setMessage("ستُفتح صفحة Quotex. سجّل دخولك.")
                 .setPositiveButton("متابعة") { _, _ -> showMarket() }
                 .setNegativeButton("إلغاء", null)
                 .show()
@@ -322,7 +327,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 30, 0, 10)
         }
         layout.addView(tvBalance)
-        
+
         tvPL = TextView(this).apply {
             text = "الربح/الخسارة: —"
             textSize = 16f
@@ -364,7 +369,7 @@ class MainActivity : AppCompatActivity() {
         layout.addView(etStopProfit)
 
         btnEnableCopy = Button(this).apply {
-            text = "👥 تفعيل النسخ (Copy Trading)"
+            text = "👥 تفعيل النسخ (Copy)"
             setBackgroundColor(Color.parseColor("#d4af37"))
             setTextColor(Color.BLACK)
             textSize = 16f
@@ -466,8 +471,6 @@ class MainActivity : AppCompatActivity() {
         webView.visibility = android.view.View.VISIBLE
         statusBar.text = "📈 السوق"
         updateTabButtons()
-        
-        // إذا لم تكن الصفحة محملة، حملها. لا نعيد التحميل في كل مرة للحفاظ على الجلسة
         if (webView.url == null || !webView.url!!.contains("quotex.com")) {
             webView.loadUrl("$QX_DOMAIN/ar/trade")
         }
@@ -492,11 +495,19 @@ class MainActivity : AppCompatActivity() {
             try {
                 val req = Request.Builder().url("$BASE_URL/api/app/user_info/$licenseKey").build()
                 val res = client.newCall(req).execute()
+
+                if (res.code == 403 || res.code == 401) {
+                    withContext(Dispatchers.Main) { kickUserOut("تم إيقاف المفتاح أو حذفه") }
+                    return@launch
+                }
+
                 val json = JSONObject(res.body?.string() ?: "{}")
                 withContext(Dispatchers.Main) {
-                    if (!json.optBoolean("ok")) return@withContext
+                    if (!json.optBoolean("ok")) {
+                        kickUserOut(json.optString("error", "المفتاح غير صالح"))
+                        return@withContext
+                    }
                     isLinked = json.optBoolean("linked")
-                    
                     if (isLinked) {
                         tvLinkStatus.text = "✅ الحساب مرتبط"
                         tvLinkStatus.setTextColor(Color.parseColor("#81c784"))
@@ -508,11 +519,9 @@ class MainActivity : AppCompatActivity() {
                         btnLink.visibility = android.view.View.VISIBLE
                         btnUnlink.visibility = android.view.View.GONE
                     }
-
                     val copying = json.optBoolean("is_copying")
                     val auto = json.optBoolean("is_auto_trading")
                     isLocked = json.optBoolean("settings_locked")
-
                     if (isLocked) {
                         setFieldsEnabled(false)
                         btnEnableCopy.visibility = android.view.View.GONE
@@ -526,7 +535,6 @@ class MainActivity : AppCompatActivity() {
                         btnEnableAuto.visibility = if (isLinked) android.view.View.VISIBLE else android.view.View.GONE
                         btnStop.visibility = android.view.View.GONE
                     }
-
                     spinnerAccount.setSelection(if (json.optString("account_type") == "live") 1 else 0)
                     spinnerMode.setSelection(if (json.optString("trade_mode") == "fixed") 1 else 0)
                     etTradeValue.setText(json.optDouble("trade_value", 1.0).toString())
@@ -554,6 +562,10 @@ class MainActivity : AppCompatActivity() {
                     .post(payload.toString().toRequestBody("application/json".toMediaType()))
                     .build()
                 val res = client.newCall(req).execute()
+                if (res.code == 403) {
+                    withContext(Dispatchers.Main) { kickUserOut("تم إيقاف المفتاح") }
+                    return@launch
+                }
                 val json = JSONObject(res.body?.string() ?: "{}")
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
@@ -563,11 +575,7 @@ class MainActivity : AppCompatActivity() {
                         Toast.makeText(this@MainActivity, "❌ ${json.optString("error")}", Toast.LENGTH_LONG).show()
                     }
                 }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "خطأ: ${e.message}", Toast.LENGTH_LONG).show()
-                }
-            }
+            } catch (e: Exception) {}
         }
     }
 
@@ -578,15 +586,10 @@ class MainActivity : AppCompatActivity() {
                     .url("$BASE_URL/api/app/stop_trading/$licenseKey")
                     .post("{}".toRequestBody("application/json".toMediaType()))
                     .build()
-                val res = client.newCall(req).execute()
-                val json = JSONObject(res.body?.string() ?: "{}")
+                client.newCall(req).execute()
                 withContext(Dispatchers.Main) {
-                    if (json.optBoolean("ok")) {
-                        Toast.makeText(this@MainActivity, "⛔ تم الإيقاف", Toast.LENGTH_SHORT).show()
-                        fetchUserInfo()
-                    } else {
-                        Toast.makeText(this@MainActivity, "❌ ${json.optString("error")}", Toast.LENGTH_LONG).show()
-                    }
+                    Toast.makeText(this@MainActivity, "⛔ تم الإيقاف", Toast.LENGTH_SHORT).show()
+                    fetchUserInfo()
                 }
             } catch (e: Exception) {}
         }
@@ -595,7 +598,7 @@ class MainActivity : AppCompatActivity() {
     private fun unlinkAccount() {
         AlertDialog.Builder(this)
             .setTitle("فصل الحساب")
-            .setMessage("سيتم مسح الجلسة وتسجيل الخروج من المتصفح. متأكد؟")
+            .setMessage("سيتم مسح الجلسة. متأكد؟")
             .setPositiveButton("نعم") { _, _ ->
                 CoroutineScope(Dispatchers.IO).launch {
                     try {
@@ -604,24 +607,17 @@ class MainActivity : AppCompatActivity() {
                             .post("{}".toRequestBody("application/json".toMediaType()))
                             .build()
                         client.newCall(req).execute()
-                        
                         withContext(Dispatchers.Main) {
-                            // مسح الكوكيز والذاكرة المؤقتة بالكامل
-                            val cookieManager = CookieManager.getInstance()
-                            cookieManager.removeAllCookies(null)
-                            cookieManager.flush()
+                            val cm = CookieManager.getInstance()
+                            cm.removeAllCookies(null)
+                            cm.flush()
                             webView.clearCache(true)
                             webView.clearHistory()
-                            webView.loadUrl("about:blank") // تفريغ الصفحة
-                            
+                            webView.loadUrl("about:blank")
                             fetchUserInfo()
-                            Toast.makeText(this@MainActivity, "تم فصل الحساب", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this@MainActivity, "تم الفصل", Toast.LENGTH_SHORT).show()
                         }
-                    } catch (e: Exception) {
-                        withContext(Dispatchers.Main) {
-                            Toast.makeText(this@MainActivity, "حدث خطأ: ${e.message}", Toast.LENGTH_SHORT).show()
-                        }
-                    }
+                    } catch (e: Exception) {}
                 }
             }
             .setNegativeButton("إلغاء", null)
@@ -645,6 +641,12 @@ class MainActivity : AppCompatActivity() {
             try {
                 val req = Request.Builder().url("$BASE_URL/api/app/session_stats/$licenseKey").build()
                 val res = client.newCall(req).execute()
+
+                if (res.code == 401 || res.code == 403) {
+                    withContext(Dispatchers.Main) { kickUserOut("تم إيقاف المفتاح") }
+                    return@launch
+                }
+
                 val json = JSONObject(res.body?.string() ?: "{}")
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
@@ -685,31 +687,13 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClient() {
             override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
-            
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 if (url?.contains("quotex.com") == true) view?.evaluateJavascript(EARLY_HOOK_JS, null)
             }
-            
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
-                if (url.contains("quotex.com")) {
-                    view.evaluateJavascript(EARLY_HOOK_JS, null)
-                    
-                    // إذا كان في صفحة تسجيل الدخول، فهذا يعني أنه مسجل خروجه
-                    if (url.contains("/sign-in")) {
-                        if (isLinked) {
-                            // المستخدم سجل خروجه من المتصفح، نقوم بفصل الحساب تلقائياً من السيرفر
-                            CoroutineScope(Dispatchers.IO).launch {
-                                try {
-                                    val req = Request.Builder().url("$BASE_URL/api/app/unlink/$licenseKey").post("{}".toRequestBody("application/json".toMediaType())).build()
-                                    client.newCall(req).execute()
-                                    withContext(Dispatchers.Main) { fetchUserInfo() }
-                                } catch (e: Exception) {}
-                            }
-                        }
-                    }
-                }
+                if (url.contains("quotex.com")) view.evaluateJavascript(EARLY_HOOK_JS, null)
             }
         }
     }
@@ -718,7 +702,6 @@ class MainActivity : AppCompatActivity() {
         if (isProcessingSSID || ssid.length < 25) return
         isProcessingSSID = true
         val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
-
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val payload = JSONObject().apply {
@@ -730,11 +713,8 @@ class MainActivity : AppCompatActivity() {
                 val req = Request.Builder().url("$BASE_URL/api/link").post(payload.toString().toRequestBody("application/json".toMediaType())).build()
                 val res = client.newCall(req).execute()
                 val json = JSONObject(res.body?.string() ?: "{}")
-
                 withContext(Dispatchers.Main) {
-                    if (json.optBoolean("ok")) {
-                        fetchUserInfo() // تحديث الواجهة بصمت
-                    }
+                    if (json.optBoolean("ok")) fetchUserInfo()
                     isProcessingSSID = false
                 }
             } catch (e: Exception) {
@@ -747,8 +727,9 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun onSsid(ssid: String) {
             if (ssid.length < 25) return
-            // إرسال بصمت في الخلفية، بدون تحديث الواجهة
-            sendToServer(ssid)
+            runOnUiThread {
+                if (currentTab == "market") sendToServer(ssid)
+            }
         }
     }
 
