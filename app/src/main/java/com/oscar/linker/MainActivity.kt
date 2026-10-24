@@ -60,6 +60,7 @@ class MainActivity : AppCompatActivity() {
     private var isLocked = false
     private var statsHandler: Handler? = null
     private var isProcessingSSID = false
+    private var isNotificationShowing = false
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -123,8 +124,10 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("oscar_prefs", Context.MODE_PRIVATE)
         val saved = prefs.getString("license_key", null)
-        if (saved.isNullOrBlank()) showKeyDialog()
-        else {
+        
+        if (saved.isNullOrBlank()) {
+            showKeyDialog()
+        } else {
             licenseKey = saved
             validateKey(saved) { ok, err ->
                 if (ok) { setupUi(); showSettings() }
@@ -340,6 +343,13 @@ class MainActivity : AppCompatActivity() {
         layout.addView(makeLabel("نوع الحساب:"))
         spinnerAccount = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("تجريبي (Demo)", "حقيقي (Live)"))
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p: AdapterView<*>?, v: android.view.View?, pos: Int, id: Long) {
+                    // جلب رصيد الحساب المحدد فوراً
+                    if (::licenseKey.isInitialized) fetchStats()
+                }
+                override fun onNothingSelected(p: AdapterView<*>?) {}
+            }
         }
         layout.addView(spinnerAccount)
 
@@ -521,7 +531,9 @@ class MainActivity : AppCompatActivity() {
                     }
                     val copying = json.optBoolean("is_copying")
                     val auto = json.optBoolean("is_auto_trading")
+                    val adminAutoEnabled = json.optBoolean("admin_auto_enabled", true)
                     isLocked = json.optBoolean("settings_locked")
+                    
                     if (isLocked) {
                         setFieldsEnabled(false)
                         btnEnableCopy.visibility = android.view.View.GONE
@@ -535,13 +547,56 @@ class MainActivity : AppCompatActivity() {
                         btnEnableAuto.visibility = if (isLinked) android.view.View.VISIBLE else android.view.View.GONE
                         btnStop.visibility = android.view.View.GONE
                     }
+
+                    // التحقق من تعطيل المدير للتداول الآلي
+                    if (!adminAutoEnabled) {
+                        btnEnableAuto.isEnabled = false
+                        btnEnableAuto.text = "🚫 التداول الآلي معطّل (من المدير)"
+                        btnEnableAuto.setBackgroundColor(Color.parseColor("#555555"))
+                    } else {
+                        btnEnableAuto.isEnabled = true
+                        btnEnableAuto.text = "🤖 تفعيل التداول الآلي (Auto)"
+                        btnEnableAuto.setBackgroundColor(Color.parseColor("#2e7d32"))
+                    }
+
                     spinnerAccount.setSelection(if (json.optString("account_type") == "live") 1 else 0)
                     spinnerMode.setSelection(if (json.optString("trade_mode") == "fixed") 1 else 0)
                     etTradeValue.setText(json.optDouble("trade_value", 1.0).toString())
                     etStopLoss.setText(json.optDouble("max_loss_value", 0.0).toString())
                     etStopProfit.setText(json.optDouble("max_profit_value", 0.0).toString())
                     updateHints()
+
+                    val notification = json.optString("notification", "")
+                    if (notification.isNotEmpty() && !isNotificationShowing) {
+                        showCenterNotification(notification)
+                    }
                 }
+            } catch (e: Exception) {}
+        }
+    }
+
+    private fun showCenterNotification(msg: String) {
+        isNotificationShowing = true
+        AlertDialog.Builder(this)
+            .setTitle("🔔 إشعار هام")
+            .setMessage(msg)
+            .setCancelable(false)
+            .setPositiveButton("حسناً") { _, _ ->
+                isNotificationShowing = false
+                clearNotification()
+            }
+            .show()
+    }
+
+    private fun clearNotification() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val req = Request.Builder()
+                    .url("$BASE_URL/api/app/clear_notification/$licenseKey")
+                    .post("{}".toRequestBody("application/json".toMediaType()))
+                    .build()
+                client.newCall(req).execute()
+                withContext(Dispatchers.Main) { fetchUserInfo() }
             } catch (e: Exception) {}
         }
     }
@@ -569,13 +624,21 @@ class MainActivity : AppCompatActivity() {
                 val json = JSONObject(res.body?.string() ?: "{}")
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
-                        Toast.makeText(this@MainActivity, "✅ تم التفعيل", Toast.LENGTH_SHORT).show()
+                        val bal = json.optDouble("balance", 0.0)
+                        val acc = json.optString("account_type", "demo")
+                        val accName = if (acc == "live") "حقيقي" else "تجريبي"
+                        tvBalance.text = String.format("الرصيد (%s): $%.2f", accName, bal)
+                        Toast.makeText(this@MainActivity, "✅ تم التفعيل - الرصيد: $${String.format("%.2f", bal)}", Toast.LENGTH_LONG).show()
                         fetchUserInfo()
                     } else {
                         Toast.makeText(this@MainActivity, "❌ ${json.optString("error")}", Toast.LENGTH_LONG).show()
                     }
                 }
-            } catch (e: Exception) {}
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "خطأ: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -629,7 +692,10 @@ class MainActivity : AppCompatActivity() {
         statsHandler = Handler(Looper.getMainLooper())
         val runnable = object : Runnable {
             override fun run() {
-                if (currentTab == "settings" && isLinked) fetchStats()
+                if (currentTab == "settings" && isLinked) {
+                    fetchStats()
+                    fetchUserInfo()
+                }
                 statsHandler?.postDelayed(this, 15000)
             }
         }
@@ -637,9 +703,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun fetchStats() {
+        if (!::licenseKey.isInitialized) return
+        val accType = if (spinnerAccount.selectedItemPosition == 1) "live" else "demo"
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val req = Request.Builder().url("$BASE_URL/api/app/session_stats/$licenseKey").build()
+                val req = Request.Builder().url("$BASE_URL/api/app/session_stats/$licenseKey?account=$accType").build()
                 val res = client.newCall(req).execute()
 
                 if (res.code == 401 || res.code == 403) {
@@ -653,7 +721,8 @@ class MainActivity : AppCompatActivity() {
                         val balance = json.optDouble("balance", 0.0)
                         val diff = json.optDouble("diff", 0.0)
                         val pct = json.optDouble("pct", 0.0)
-                        tvBalance.text = String.format("الرصيد: $%.2f", balance)
+                        val accName = if (accType == "live") "حقيقي" else "تجريبي"
+                        tvBalance.text = String.format("الرصيد (%s): $%.2f", accName, balance)
                         if (diff > 0) {
                             tvPL.text = String.format("+$%.2f (+%.2f%%)", diff, pct)
                             tvPL.setTextColor(Color.parseColor("#4caf50"))
@@ -664,6 +733,8 @@ class MainActivity : AppCompatActivity() {
                             tvPL.text = "الربح/الخسارة: $0.00"
                             tvPL.setTextColor(Color.GRAY)
                         }
+                    } else {
+                        tvBalance.text = String.format("الرصيد (%s): تعذر الجلب", if (accType == "live") "حقيقي" else "تجريبي")
                     }
                 }
             } catch (e: Exception) {}
