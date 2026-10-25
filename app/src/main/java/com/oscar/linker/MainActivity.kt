@@ -558,9 +558,6 @@ class MainActivity : AppCompatActivity() {
                     val newCopying = json.optBoolean("is_copying")
                     val newAuto = json.optBoolean("is_auto_trading")
                     
-                    // تحديث الحالة إذا تغيرت من السيرفر (مثلاً STOP_LIMIT)
-                    val stateChanged = (isLocked != newLocked) || (isCopying != newCopying) || (isAutoTrading != newAuto)
-                    
                     isLocked = newLocked
                     isCopying = newCopying
                     isAutoTrading = newAuto
@@ -583,7 +580,7 @@ class MainActivity : AppCompatActivity() {
                         btnEnableAuto.visibility = android.view.View.GONE
                         btnStop.visibility = android.view.View.VISIBLE
                         if (isCopying) tvLinkStatus.append("\n👥 النسخ مفعّل")
-                        else if (isAuto) tvLinkStatus.append("\n🤖 التداول الآلي مفعّل")
+                        else if (isAutoTrading) tvLinkStatus.append("\n🤖 التداول الآلي مفعّل")
                     } else {
                         setFieldsEnabled(true)
                         btnEnableCopy.visibility = if (isLinked) android.view.View.VISIBLE else android.view.View.GONE
@@ -611,11 +608,6 @@ class MainActivity : AppCompatActivity() {
                     val notification = json.optString("notification", "")
                     if (notification.isNotEmpty() && !isNotificationShowing) {
                         showCenterNotification(notification)
-                    }
-                    
-                    // إذا تغيرت الحالة ولم تكن على الإعدادات، عرض تنبيه سريع
-                    if (stateChanged && currentTab == "market" && isLocked) {
-                        Toast.makeText(this@MainActivity, "ℹ️ تم تحديث حالة التداول", Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {}
@@ -751,9 +743,7 @@ class MainActivity : AppCompatActivity() {
             override fun run() {
                 pollCount++
                 if (::licenseKey.isInitialized) {
-                    // فحص حالة المستخدم كل 5 ثوان على أي تبويب
                     fetchUserInfo()
-                    // جلب الرصيد كل 15 ثانية فقط على تبويب الإعدادات
                     if (currentTab == "settings" && isLinked && pollCount % 3 == 0) {
                         fetchStats()
                     }
