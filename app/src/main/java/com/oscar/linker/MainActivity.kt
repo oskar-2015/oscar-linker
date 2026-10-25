@@ -612,4 +612,288 @@ class MainActivity : AppCompatActivity() {
                         btnEnableAuto.setBackgroundColor(Color.parseColor("#2e7d32"))
                     }
 
-                    // ★★★ الحل الجذري: نملأ الح
+                    // ★★★ الحل الجذري: نملأ الحقول فقط في المرة الأولى
+                    // أو عندما يتحول settings_locked من false إلى true (نقفل ونملأ)
+                    val shouldPopulate = !uiPopulated || (newLocked && !lastServerLocked)
+                    if (shouldPopulate) {
+                        lastServerAccountType = serverAccountType
+                        spinnerAccount.setSelection(if (serverAccountType == "live") 1 else 0)
+                        spinnerMode.setSelection(if (json.optString("trade_mode") == "fixed") 1 else 0)
+                        etTradeValue.setText(json.optDouble("trade_value", 1.0).toString())
+                        etStopLoss.setText(json.optDouble("max_loss_value", 0.0).toString())
+                        etStopProfit.setText(json.optDouble("max_profit_value", 0.0).toString())
+                        updateHints()
+                        uiPopulated = true
+                    }
+                    lastServerLocked = newLocked
+
+                    // إذا مربوط وأي حساب مفعّل، نحدّث الرصيد إن لم نكن نبدّل
+                    if (isLinked && (isCopying || isAutoTrading) && !isLocked.not() && uiPopulated) {
+                        fetchStatsForAccount(serverAccountType)
+                    }
+
+                    val notification = json.optString("notification", "")
+                    if (notification.isNotEmpty() && !isNotificationShowing) {
+                        showCenterNotification(notification)
+                    }
+                }
+            } catch (e: Exception) {}
+        }
+    }
+
+    private fun showCenterNotification(msg: String) {
+        isNotificationShowing = true
+        currentDialog = AlertDialog.Builder(this)
+            .setTitle("🔔 إشعار هام")
+            .setMessage(msg)
+            .setCancelable(false)
+            .setPositiveButton("حسناً") { _, _ ->
+                isNotificationShowing = false
+                currentDialog = null
+                clearNotification()
+            }
+            .show()
+    }
+
+    private fun clearNotification() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val req = Request.Builder()
+                    .url("$BASE_URL/api/app/clear_notification/$licenseKey")
+                    .post("{}".toRequestBody("application/json".toMediaType()))
+                    .build()
+                client.newCall(req).execute()
+                withContext(Dispatchers.Main) { fetchUserInfo() }
+            } catch (e: Exception) {}
+        }
+    }
+
+    private fun saveAndEnable(type: String) {
+        val accountType = if (spinnerAccount.selectedItemPosition == 1) "live" else "demo"
+        val payload = JSONObject().apply {
+            put("account_type", accountType)
+            put("trade_mode", if (spinnerMode.selectedItemPosition == 1) "fixed" else "percent")
+            put("trade_value", etTradeValue.text.toString().toDoubleOrNull() ?: 1.0)
+            put("max_loss_value", etStopLoss.text.toString().toDoubleOrNull() ?: 0.0)
+            put("max_profit_value", etStopProfit.text.toString().toDoubleOrNull() ?: 0.0)
+            put("enable_type", type)
+        }
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val req = Request.Builder()
+                    .url("$BASE_URL/api/app/save_and_enable/$licenseKey")
+                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
+                val res = client.newCall(req).execute()
+                if (res.code == 403) {
+                    withContext(Dispatchers.Main) { kickUserOut("تم إيقاف المفتاح") }
+                    return@launch
+                }
+                val json = JSONObject(res.body?.string() ?: "{}")
+                withContext(Dispatchers.Main) {
+                    if (json.optBoolean("ok")) {
+                        val bal = json.optDouble("balance", 0.0)
+                        val accName = if (accountType == "live") "حقيقي" else "تجريبي"
+                        tvBalance.text = String.format("الرصيد (%s): $%.2f", accName, bal)
+                        Toast.makeText(this@MainActivity, "✅ تم التفعيل", Toast.LENGTH_SHORT).show()
+                        uiPopulated = true
+                        fetchUserInfo()
+                    } else {
+                        val err = json.optString("error", "خطأ")
+                        Toast.makeText(this@MainActivity, "❌ $err", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "خطأ اتصال: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun stopTrading() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val req = Request.Builder()
+                    .url("$BASE_URL/api/app/stop_trading/$licenseKey")
+                    .post("{}".toRequestBody("application/json".toMediaType()))
+                    .build()
+                client.newCall(req).execute()
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "⛔ تم الإيقاف", Toast.LENGTH_SHORT).show()
+                    fetchUserInfo()
+                }
+            } catch (e: Exception) {}
+        }
+    }
+
+    private fun unlinkAccount() {
+        AlertDialog.Builder(this)
+            .setTitle("فصل الحساب")
+            .setMessage("سيتم مسح الجلسة. متأكد؟")
+            .setPositiveButton("نعم") { _, _ ->
+                CoroutineScope(Dispatchers.IO).launch {
+                    try {
+                        val req = Request.Builder()
+                            .url("$BASE_URL/api/app/unlink/$licenseKey")
+                            .post("{}".toRequestBody("application/json".toMediaType()))
+                            .build()
+                        client.newCall(req).execute()
+                        withContext(Dispatchers.Main) {
+                            val cm = CookieManager.getInstance()
+                            cm.removeAllCookies(null)
+                            cm.flush()
+                            webView.clearCache(true)
+                            webView.clearHistory()
+                            webView.loadUrl("about:blank")
+                            uiPopulated = false  // ★ إعادة التهيئة
+                            fetchUserInfo()
+                        }
+                    } catch (e: Exception) {}
+                }
+            }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
+
+    private fun startStatsPolling() {
+        statsHandler?.removeCallbacksAndMessages(null)
+        statsHandler = Handler(Looper.getMainLooper())
+        tickCount = 0
+        val runnable = object : Runnable {
+            override fun run() {
+                tickCount++
+                if (::licenseKey.isInitialized) {
+                    // user_info كل 15 ثانية (كل 3 ticks)
+                    if (tickCount % 3 == 0) fetchUserInfo()
+                    // stats كل 60 ثانية (كل 12 ticks) فقط على الإعدادات
+                    if (currentTab == "settings" && isLinked && !isLocked && tickCount % 12 == 0) {
+                        val accType = if (spinnerAccount.selectedItemPosition == 1) "live" else "demo"
+                        fetchStatsForAccount(accType)
+                    }
+                }
+                statsHandler?.postDelayed(this, 5000)
+            }
+        }
+        statsHandler?.postDelayed(runnable, 3000)
+    }
+
+    private fun fetchStatsForAccount(accType: String) {
+        if (!::licenseKey.isInitialized) return
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val req = Request.Builder().url("$BASE_URL/api/app/session_stats/$licenseKey?account=$accType").build()
+                val res = client.newCall(req).execute()
+
+                if (res.code == 401 || res.code == 403) {
+                    withContext(Dispatchers.Main) { kickUserOut("تم إيقاف المفتاح") }
+                    return@launch
+                }
+
+                val json = JSONObject(res.body?.string() ?: "{}")
+                withContext(Dispatchers.Main) {
+                    val accName = if (accType == "live") "حقيقي" else "تجريبي"
+                    if (json.optBoolean("ok")) {
+                        val balance = json.optDouble("balance", 0.0)
+                        val diff = json.optDouble("diff", 0.0)
+                        val pct = json.optDouble("pct", 0.0)
+                        tvBalance.text = String.format("الرصيد (%s): $%.2f", accName, balance)
+                        if (diff > 0) {
+                            tvPL.text = String.format("+$%.2f (+%.2f%%)", diff, pct)
+                            tvPL.setTextColor(Color.parseColor("#4caf50"))
+                        } else if (diff < 0) {
+                            tvPL.text = String.format("-$%.2f (%.2f%%)", Math.abs(diff), pct)
+                            tvPL.setTextColor(Color.parseColor("#f44336"))
+                        } else {
+                            tvPL.text = "الربح/الخسارة: $0.00"
+                            tvPL.setTextColor(Color.GRAY)
+                        }
+                    } else {
+                        val err = json.optString("error", "")
+                        val msg = when {
+                            err.contains("cooldown") -> "⏳ الخادم محظور مؤقتاً"
+                            err.contains("rejected") -> "⚠️ أعد الربط من السوق"
+                            err.contains("no_session") -> "⚠️ الحساب غير مرتبط"
+                            else -> "تعذر الجلب"
+                        }
+                        tvBalance.text = String.format("الرصيد (%s): %s", accName, msg)
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    tvBalance.text = "الرصيد: تعذر الاتصال"
+                }
+            }
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
+    private fun configureWebView() {
+        webView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            loadWithOverviewMode = true
+            useWideViewPort = true
+            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        }
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        webView.addJavascriptInterface(Bridge(), "OscarBridge")
+
+        webView.webViewClient = object : WebViewClient() {
+            override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
+            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                if (url?.contains("quotex.com") == true) view?.evaluateJavascript(EARLY_HOOK_JS, null)
+            }
+            override fun onPageFinished(view: WebView, url: String) {
+                super.onPageFinished(view, url)
+                if (url.contains("quotex.com")) view.evaluateJavascript(EARLY_HOOK_JS, null)
+            }
+        }
+    }
+
+    private fun sendToServer(ssid: String) {
+        if (isProcessingSSID || ssid.length < 25) return
+        isProcessingSSID = true
+        val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val payload = JSONObject().apply {
+                    put("license_key", licenseKey)
+                    put("ssid", ssid)
+                    put("cookies", cookies)
+                    put("email", "")
+                }
+                val req = Request.Builder().url("$BASE_URL/api/link").post(payload.toString().toRequestBody("application/json".toMediaType())).build()
+                val res = client.newCall(req).execute()
+                val json = JSONObject(res.body?.string() ?: "{}")
+                withContext(Dispatchers.Main) {
+                    if (json.optBoolean("ok")) fetchUserInfo()
+                    isProcessingSSID = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { isProcessingSSID = false }
+            }
+        }
+    }
+
+    inner class Bridge {
+        @JavascriptInterface
+        fun onSsid(ssid: String) {
+            if (ssid.length < 25) return
+            runOnUiThread {
+                if (currentTab == "market") sendToServer(ssid)
+            }
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (currentTab == "market") showSettings()
+        else if (::webView.isInitialized && webView.canGoBack() && webView.visibility == android.view.View.VISIBLE) webView.goBack()
+        else super.onBackPressed()
+    }
+}
