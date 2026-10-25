@@ -59,10 +59,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
     private var isLinked = false
     private var isLocked = false
+    private var isCopying = false
+    private var isAutoTrading = false
     private var statsHandler: Handler? = null
     private var isProcessingSSID = false
     private var isNotificationShowing = false
     private var isShowingKeyDialog = false
+    private var currentDialog: AlertDialog? = null
+    private var pollCount = 0
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(45, TimeUnit.SECONDS)
@@ -131,7 +135,6 @@ class MainActivity : AppCompatActivity() {
             showKeyDialog()
         } else {
             licenseKey = saved
-            // محاولة التحقق مع إعادة المحاولة
             validateKeyWithRetry(saved) { ok, err ->
                 if (ok) { setupUi(); showSettings() }
                 else { kickUserOut(err) }
@@ -140,8 +143,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun kickUserOut(reason: String) {
+        try { currentDialog?.dismiss() } catch (_: Exception) {}
+        currentDialog = null
+        isNotificationShowing = false
+
         Toast.makeText(this, "❌ $reason", Toast.LENGTH_LONG).show()
         prefs.edit().remove("license_key").apply()
+        
         try {
             val cm = CookieManager.getInstance()
             cm.removeAllCookies(null)
@@ -152,6 +160,7 @@ class MainActivity : AppCompatActivity() {
                 webView.loadUrl("about:blank")
             }
         } catch(e: Exception) {}
+        
         Handler(Looper.getMainLooper()).postDelayed({
             finish()
             startActivity(Intent(this, MainActivity::class.java))
@@ -211,10 +220,6 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
-    /**
-     * يتحقق من المفتاح مع إعادة المحاولة التلقائية عند فشل الشبكة.
-     * الفشل الحقيقي (مفتاح خاطئ) لا يعيد المحاولة.
-     */
     private fun validateKeyWithRetry(key: String, onResult: (Boolean, String) -> Unit) {
         CoroutineScope(Dispatchers.IO).launch {
             var lastErr = "خطأ اتصال"
@@ -223,7 +228,6 @@ class MainActivity : AppCompatActivity() {
                     val req = Request.Builder().url("$BASE_URL/api/app/user_info/$key").build()
                     val res = client.newCall(req).execute()
                     
-                    // 401/403 = مفتاح خاطئ فعلاً (لا نعيد المحاولة)
                     if (res.code == 401 || res.code == 403) {
                         val json = JSONObject(res.body?.string() ?: "{}")
                         val err = json.optString("error", "المفتاح غير صالح، معطل، أو منتهي")
@@ -231,12 +235,9 @@ class MainActivity : AppCompatActivity() {
                         return@launch
                     }
                     
-                    // نجاح
                     if (res.isSuccessful) {
                         val json = JSONObject(res.body?.string() ?: "{}")
-                        val ok = json.optBoolean("ok")
-                        val err = json.optString("error", "")
-                        withContext(Dispatchers.Main) { onResult(ok, err) }
+                        withContext(Dispatchers.Main) { onResult(json.optBoolean("ok"), json.optString("error", "")) }
                         return@launch
                     }
                     
@@ -245,12 +246,7 @@ class MainActivity : AppCompatActivity() {
                     lastErr = e.message ?: "خطأ اتصال"
                 }
                 
-                if (attempt < 3) {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(this@MainActivity, "محاولة $attempt/3 فشلت، إعادة المحاولة...", Toast.LENGTH_SHORT).show()
-                    }
-                    delay(2500L * attempt)
-                }
+                if (attempt < 3) delay(2500L * attempt)
             }
             withContext(Dispatchers.Main) { onResult(false, "تعذر الاتصال بالخادم. تحقق من الإنترنت: $lastErr") }
         }
@@ -316,6 +312,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(bottomBar)
         setContentView(root)
         configureWebView()
+        startStatsPolling()
     }
 
     private fun createSettingsView(): ScrollView {
@@ -352,7 +349,7 @@ class MainActivity : AppCompatActivity() {
         btnLink.setOnClickListener {
             AlertDialog.Builder(this@MainActivity)
                 .setTitle("🔗 ربط الحساب")
-                .setMessage("ستُفتح صفحة Quotex. سجّل دخولك، وسيتم الربط تلقائياً.")
+                .setMessage("ستُفتح صفحة Quotex. سجّل دخولك.")
                 .setPositiveButton("متابعة") { _, _ -> showMarket() }
                 .setNegativeButton("إلغاء", null)
                 .show()
@@ -383,7 +380,7 @@ class MainActivity : AppCompatActivity() {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("تجريبي (Demo)", "حقيقي (Live)"))
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(p: AdapterView<*>?, v: android.view.View?, pos: Int, id: Long) {
-                    if (::licenseKey.isInitialized) fetchStats()
+                    if (::licenseKey.isInitialized && isLinked) fetchStats()
                 }
                 override fun onNothingSelected(p: AdapterView<*>?) {}
             }
@@ -509,7 +506,7 @@ class MainActivity : AppCompatActivity() {
         statusBar.text = "📊 الإعدادات"
         updateTabButtons()
         fetchUserInfo()
-        startStatsPolling()
+        if (isLinked) fetchStats()
     }
 
     private fun showMarket() {
@@ -544,7 +541,7 @@ class MainActivity : AppCompatActivity() {
                 val res = client.newCall(req).execute()
 
                 if (res.code == 403 || res.code == 401) {
-                    withContext(Dispatchers.Main) { kickUserOut("تم إيقاف المفتاح أو حذفه") }
+                    withContext(Dispatchers.Main) { kickUserOut("تم إيقاف المفتاح أو حذفه من قبل المدير") }
                     return@launch
                 }
 
@@ -554,7 +551,20 @@ class MainActivity : AppCompatActivity() {
                         kickUserOut(json.optString("error", "المفتاح غير صالح"))
                         return@withContext
                     }
+                    
                     isLinked = json.optBoolean("linked")
+                    val adminAutoEnabled = json.optBoolean("admin_auto_enabled", true)
+                    val newLocked = json.optBoolean("settings_locked")
+                    val newCopying = json.optBoolean("is_copying")
+                    val newAuto = json.optBoolean("is_auto_trading")
+                    
+                    // تحديث الحالة إذا تغيرت من السيرفر (مثلاً STOP_LIMIT)
+                    val stateChanged = (isLocked != newLocked) || (isCopying != newCopying) || (isAutoTrading != newAuto)
+                    
+                    isLocked = newLocked
+                    isCopying = newCopying
+                    isAutoTrading = newAuto
+                    
                     if (isLinked) {
                         tvLinkStatus.text = "✅ الحساب مرتبط"
                         tvLinkStatus.setTextColor(Color.parseColor("#81c784"))
@@ -566,18 +576,14 @@ class MainActivity : AppCompatActivity() {
                         btnLink.visibility = android.view.View.VISIBLE
                         btnUnlink.visibility = android.view.View.GONE
                     }
-                    val copying = json.optBoolean("is_copying")
-                    val auto = json.optBoolean("is_auto_trading")
-                    val adminAutoEnabled = json.optBoolean("admin_auto_enabled", true)
-                    isLocked = json.optBoolean("settings_locked")
                     
                     if (isLocked) {
                         setFieldsEnabled(false)
                         btnEnableCopy.visibility = android.view.View.GONE
                         btnEnableAuto.visibility = android.view.View.GONE
                         btnStop.visibility = android.view.View.VISIBLE
-                        if (copying) tvLinkStatus.append("\n👥 النسخ مفعّل")
-                        else if (auto) tvLinkStatus.append("\n🤖 التداول الآلي مفعّل")
+                        if (isCopying) tvLinkStatus.append("\n👥 النسخ مفعّل")
+                        else if (isAuto) tvLinkStatus.append("\n🤖 التداول الآلي مفعّل")
                     } else {
                         setFieldsEnabled(true)
                         btnEnableCopy.visibility = if (isLinked) android.view.View.VISIBLE else android.view.View.GONE
@@ -606,6 +612,11 @@ class MainActivity : AppCompatActivity() {
                     if (notification.isNotEmpty() && !isNotificationShowing) {
                         showCenterNotification(notification)
                     }
+                    
+                    // إذا تغيرت الحالة ولم تكن على الإعدادات، عرض تنبيه سريع
+                    if (stateChanged && currentTab == "market" && isLocked) {
+                        Toast.makeText(this@MainActivity, "ℹ️ تم تحديث حالة التداول", Toast.LENGTH_SHORT).show()
+                    }
                 }
             } catch (e: Exception) {}
         }
@@ -613,12 +624,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun showCenterNotification(msg: String) {
         isNotificationShowing = true
-        AlertDialog.Builder(this)
+        currentDialog = AlertDialog.Builder(this)
             .setTitle("🔔 إشعار هام")
             .setMessage(msg)
             .setCancelable(false)
             .setPositiveButton("حسناً") { _, _ ->
                 isNotificationShowing = false
+                currentDialog = null
                 clearNotification()
             }
             .show()
@@ -664,10 +676,19 @@ class MainActivity : AppCompatActivity() {
                         val acc = json.optString("account_type", "demo")
                         val accName = if (acc == "live") "حقيقي" else "تجريبي"
                         tvBalance.text = String.format("الرصيد (%s): $%.2f", accName, bal)
-                        Toast.makeText(this@MainActivity, "✅ تم التفعيل - الرصيد: $${String.format("%.2f", bal)}", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this@MainActivity, "✅ تم التفعيل", Toast.LENGTH_SHORT).show()
                         fetchUserInfo()
                     } else {
-                        Toast.makeText(this@MainActivity, "❌ ${json.optString("error")}", Toast.LENGTH_LONG).show()
+                        val err = json.optString("error", "خطأ")
+                        val msg = when {
+                            err.contains("cooldown") -> "الخادم محظور مؤقتاً، انتظر قليلاً ثم حاول مجدداً"
+                            err.contains("rejected") -> "الجلسة منتهية، اذهب للسوق وأعد تسجيل الدخول"
+                            err.contains("timeout") -> "انتهت المهلة، تحقق من الاتصال"
+                            err.contains("صفر") || err.contains("تعذر") -> "تعذر جلب الرصيد، أعد الربط من السوق"
+                            err.contains("معطّل") -> err
+                            else -> err
+                        }
+                        Toast.makeText(this@MainActivity, "❌ $msg", Toast.LENGTH_LONG).show()
                     }
                 }
             } catch (e: Exception) {
@@ -714,7 +735,6 @@ class MainActivity : AppCompatActivity() {
                             webView.clearHistory()
                             webView.loadUrl("about:blank")
                             fetchUserInfo()
-                            Toast.makeText(this@MainActivity, "تم الفصل", Toast.LENGTH_SHORT).show()
                         }
                     } catch (e: Exception) {}
                 }
@@ -726,13 +746,19 @@ class MainActivity : AppCompatActivity() {
     private fun startStatsPolling() {
         statsHandler?.removeCallbacksAndMessages(null)
         statsHandler = Handler(Looper.getMainLooper())
+        pollCount = 0
         val runnable = object : Runnable {
             override fun run() {
-                if (currentTab == "settings" && isLinked) {
-                    fetchStats()
+                pollCount++
+                if (::licenseKey.isInitialized) {
+                    // فحص حالة المستخدم كل 5 ثوان على أي تبويب
                     fetchUserInfo()
+                    // جلب الرصيد كل 15 ثانية فقط على تبويب الإعدادات
+                    if (currentTab == "settings" && isLinked && pollCount % 3 == 0) {
+                        fetchStats()
+                    }
                 }
-                statsHandler?.postDelayed(this, 15000)
+                statsHandler?.postDelayed(this, 5000)
             }
         }
         statsHandler?.postDelayed(runnable, 1000)
@@ -753,11 +779,11 @@ class MainActivity : AppCompatActivity() {
 
                 val json = JSONObject(res.body?.string() ?: "{}")
                 withContext(Dispatchers.Main) {
+                    val accName = if (accType == "live") "حقيقي" else "تجريبي"
                     if (json.optBoolean("ok")) {
                         val balance = json.optDouble("balance", 0.0)
                         val diff = json.optDouble("diff", 0.0)
                         val pct = json.optDouble("pct", 0.0)
-                        val accName = if (accType == "live") "حقيقي" else "تجريبي"
                         tvBalance.text = String.format("الرصيد (%s): $%.2f", accName, balance)
                         if (diff > 0) {
                             tvPL.text = String.format("+$%.2f (+%.2f%%)", diff, pct)
@@ -770,7 +796,14 @@ class MainActivity : AppCompatActivity() {
                             tvPL.setTextColor(Color.GRAY)
                         }
                     } else {
-                        tvBalance.text = String.format("الرصيد (%s): تعذر الجلب", if (accType == "live") "حقيقي" else "تجريبي")
+                        val err = json.optString("error", "")
+                        val msg = when {
+                            err.contains("cooldown") -> "⏳ الخادم محظور مؤقتاً"
+                            err.contains("rejected") -> "⚠️ أعد الربط من السوق"
+                            err.contains("no_session") -> "⚠️ الحساب غير مرتبط"
+                            else -> "تعذر الجلب"
+                        }
+                        tvBalance.text = String.format("الرصيد (%s): %s", accName, msg)
                     }
                 }
             } catch (e: Exception) {}
