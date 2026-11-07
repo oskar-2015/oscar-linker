@@ -121,6 +121,11 @@ class MainActivity : AppCompatActivity() {
 
     // وضع الراحة، الأحداث، الأصوات، الخلفية
     private var restMode = false
+    private var qxBlockMin = 0
+    private var lastAutoUnlink = 0L
+    private var pairAsset: String = ""
+    private var pairTries = 0
+    private var pairDone = false
     private var lastEventId = -1L
     private var eventsBusy = false
     private var bgBusy = false
@@ -143,15 +148,7 @@ class MainActivity : AppCompatActivity() {
     private var strategyItems: List<JSONObject> = emptyList()
 
     // معرّف الجهاز: يُربط به المفتاح، فلا يعمل المفتاح نفسه على جهاز آخر
-    private val deviceId: String by lazy {
-        val sp = getSharedPreferences("oscar_prefs", Context.MODE_PRIVATE)
-        var id = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: ""
-        if (id.length < 8 || id == "9774d56d682e549c") {
-            id = sp.getString("fallback_device_id", null)
-                ?: UUID.randomUUID().toString().replace("-", "").also { sp.edit().putString("fallback_device_id", it).apply() }
-        }
-        "and-$id"
-    }
+    private val deviceId: String by lazy { Notifs.deviceId(this) }
 
     private val client by lazy {
         OkHttpClient.Builder()
@@ -296,7 +293,7 @@ class MainActivity : AppCompatActivity() {
         window.statusBarColor = cBg
         window.navigationBarColor = cBg
         prefs = getSharedPreferences("oscar_prefs", Context.MODE_PRIVATE)
-        ensureNotificationChannel()
+        Notifs.ensureChannels(this)
         askNotificationPermission()
         pendingOpenAsset = intent?.getStringExtra("open_asset")
         val saved = prefs.getString("license_key", null)
@@ -323,7 +320,7 @@ class MainActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         val a = intent.getStringExtra("open_asset")
-        if (!a.isNullOrEmpty() && ::webView.isInitialized) openMarketForAsset(a, "")
+        if (!a.isNullOrEmpty() && ::webView.isInitialized) openMarketForAsset(a, intent.getStringExtra("open_dir") ?: "")
     }
 
     override fun onResume() {
@@ -344,6 +341,7 @@ class MainActivity : AppCompatActivity() {
 
         Toast.makeText(this, "❌ $reason", Toast.LENGTH_LONG).show()
         prefs.edit().remove("license_key").apply()
+        try { stopService(Intent(this, EventService::class.java)) } catch (e: Exception) {}
 
         try {
             val cm = CookieManager.getInstance()
@@ -528,6 +526,14 @@ class MainActivity : AppCompatActivity() {
         setContentView(frame)
         configureWebView()
         startStatsPolling()
+        startEventService()
+    }
+
+    private fun startEventService() {
+        try {
+            ContextCompat.startForegroundService(this, Intent(this, EventService::class.java))
+        } catch (e: Exception) {
+        }
     }
 
     private fun segment(labels: List<String>, onPick: (Int) -> Unit): Pair<LinearLayout, List<TextView>> {
@@ -1081,7 +1087,16 @@ class MainActivity : AppCompatActivity() {
                     }
                     lastServerLocked = newLocked
 
-                    tvRest.visibility = if (restMode) View.VISIBLE else View.GONE
+                    qxBlockMin = json.optInt("qx_block_min", 0)
+                    if (restMode) {
+                        tvRest.text = "🛠️ السيرفر في وضع الراحة مؤقتاً — لا يمكن التشغيل الآن"
+                        tvRest.visibility = View.VISIBLE
+                    } else if (qxBlockMin > 0) {
+                        tvRest.text = "⏳ Quotex يحظر اتصال السيرفر مؤقتاً (نحو " + qxBlockMin + " دقيقة). لا يمكن الاتصال الآن، وسيعمل التداول تلقائياً بعد فك الحظر"
+                        tvRest.visibility = View.VISIBLE
+                    } else {
+                        tvRest.visibility = View.GONE
+                    }
                     refreshAll()
 
                     if (lastEventId < 0) {
@@ -1218,6 +1233,49 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun isLoginUrl(u: String?): Boolean {
+        val x = (u ?: "").lowercase()
+        return x.contains("/sign-in") || x.contains("/signin") || x.contains("/login")
+    }
+
+    // إذا خرج المستخدم من Quotex (أو انتهت الجلسة) نفصل الحساب في الإعدادات تلقائياً
+    private fun checkLoggedOut(url: String) {
+        if (!isLinked || !::licenseKey.isInitialized || !isLoginUrl(url)) return
+        if (System.currentTimeMillis() - lastAutoUnlink < 30000) return
+        lastAutoUnlink = System.currentTimeMillis()
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (isLinked && isLoginUrl(webView.url)) {
+                Toast.makeText(this, "🔌 تم فصل الحساب تلقائياً لأنك خرجت من Quotex", Toast.LENGTH_LONG).show()
+                doUnlink()
+            }
+        }, 2500)
+    }
+
+    private fun doUnlink() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val req = Request.Builder()
+                    .url("$BASE_URL/api/app/unlink/$licenseKey")
+                    .post("{}".toRequestBody("application/json".toMediaType()))
+                    .build()
+                client.newCall(req).execute()
+                withContext(Dispatchers.Main) {
+                    val cm = CookieManager.getInstance()
+                    cm.removeAllCookies(null)
+                    cm.flush()
+                    webView.clearCache(true)
+                    webView.clearHistory()
+                    webView.loadUrl("about:blank")
+                    uiPopulated = false
+                    tvBalance.text = "الرصيد: —"
+                    tvPL.text = ""
+                    fetchUserInfo()
+                }
+            } catch (e: Exception) {
+            }
+        }
+    }
+
     private fun unlinkAccount() {
         AlertDialog.Builder(this)
             .setTitle("فصل الحساب")
@@ -1325,64 +1383,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ───────── الإشعارات والأصوات والأحداث ─────────
-    private fun ensureNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            val ch = NotificationChannel("trades", "الصفقات", NotificationManager.IMPORTANCE_DEFAULT).apply {
-                description = "إشعارات تنفيذ الصفقات ونهاية الجلسة"
-                setSound(null, null)   // الصوت يُشغَّل من التطبيق نفسه
-            }
-            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
-        }
-    }
-
     private fun askNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (!Notifs.canNotify(this)) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 77)
         }
     }
 
-    private fun postNotification(title: String, text: String, asset: String?) {
-        if (!prefs.getBoolean("notif_enabled", true)) return
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) return
-        try {
-            val intent = Intent(this, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                if (asset != null) putExtra("open_asset", asset)
-            }
-            val pi = PendingIntent.getActivity(
-                this, (System.currentTimeMillis() % 100000).toInt(), intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            val n = NotificationCompat.Builder(this, "trades")
-                .setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle(title)
-                .setContentText(text)
-                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
-                .setAutoCancel(true)
-                .setContentIntent(pi)
-                .build()
-            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                .notify((System.currentTimeMillis() % 1000000).toInt(), n)
-        } catch (e: Exception) {
-        }
-    }
-
-    private fun prettyAsset(raw: String): String {
-        val otc = raw.endsWith("_otc", ignoreCase = true)
-        val base = raw.replace("_otc", "", ignoreCase = true)
-        val name = if (base.length == 6 && base.all { it.isLetter() }) base.substring(0, 3) + "/" + base.substring(3) else base
-        return if (otc) name + " (OTC)" else name
-    }
-
-    private fun dirAr(d: String): String = when (d.lowercase()) {
-        "call" -> "صعود ⬆️"
-        "put" -> "هبوط ⬇️"
-        else -> ""
-    }
+    private fun prettyAsset(raw: String): String = Notifs.prettyAsset(raw)
+    private fun dirAr(d: String): String = Notifs.dirAr(d)
 
     private fun fetchEvents() {
         if (!::licenseKey.isInitialized || lastEventId < 0 || eventsBusy) return
@@ -1406,33 +1414,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleEvents(list: List<JSONObject>) {
-        var openPlayed = false
+        // الأصوات والإشعارات تتولاها EventService؛ هنا نحدّث القائمة فقط
         for (ev in list) {
             val id = ev.optLong("id")
             if (id <= lastEventId) continue
             lastEventId = id
             recentEvents.add(0, ev)
-            val asset = ev.optString("asset")
-            when (ev.optString("kind")) {
-                "trade_open" -> {
-                    if (!openPlayed && prefs.getBoolean("snd_open", true)) { sound.cash(); openPlayed = true }
-                    postNotification(
-                        "تم تنفيذ صفقة",
-                        "على " + prettyAsset(asset) + " (" + dirAr(ev.optString("direction")) + ") — " + ev.optString("strategy_name"),
-                        asset
-                    )
-                }
-                "session_win" -> {
-                    if (prefs.getBoolean("snd_win", true)) sound.win()
-                    postNotification("🎉 انتهت الجلسة بربح", "تم الوصول إلى حد الربح الذي حددته.", null)
-                }
-                "session_loss" -> {
-                    if (prefs.getBoolean("snd_loss", true)) sound.loss()
-                    postNotification("⚠️ انتهت الجلسة بخسارة", "تم الوصول إلى حد الخسارة الذي حددته.", null)
-                }
-            }
         }
-        while (recentEvents.size > 12) recentEvents.removeAt(recentEvents.size - 1)
+        while (recentEvents.size > 15) recentEvents.removeAt(recentEvents.size - 1)
         prefs.edit().putLong("last_event_id_" + licenseKey, lastEventId).apply()
         renderEvents()
     }
@@ -1447,10 +1436,23 @@ class MainActivity : AppCompatActivity() {
             val dir = ev.optString("direction")
             val line1: String
             val line2: String
+            val amt = ev.optDouble("amount", 0.0)
             when (kind) {
                 "trade_open" -> {
                     line1 = "تم تنفيذ صفقة على " + prettyAsset(asset) + " " + dirAr(dir)
-                    line2 = "باستراتيجية: " + ev.optString("strategy_name") + " • مبلغ " + fmt(ev.optDouble("amount", 0.0)) + "\$ • اضغط للفتح في السوق"
+                    line2 = "باستراتيجية: " + ev.optString("strategy_name") + " • مبلغ " + fmt(amt) + "\$ • اضغط للفتح في السوق"
+                }
+                "trade_win" -> {
+                    line1 = "✅ ربحت صفقة " + prettyAsset(asset)
+                    line2 = (if (amt > 0) "ربح +" + fmt(amt) + "\$ • " else "") + ev.optString("strategy_name")
+                }
+                "trade_loss" -> {
+                    line1 = "❌ خسرت صفقة " + prettyAsset(asset)
+                    line2 = "خسارة " + fmt(Math.abs(amt)) + "\$ • " + ev.optString("strategy_name")
+                }
+                "trade_draw" -> {
+                    line1 = "➖ تعادل في صفقة " + prettyAsset(asset)
+                    line2 = "استُرد المبلغ • " + ev.optString("strategy_name")
                 }
                 "session_win" -> { line1 = "🎉 انتهت الجلسة بربح"; line2 = "وصلت لحد الربح" }
                 else -> { line1 = "⚠️ انتهت الجلسة بخسارة"; line2 = "وصلت لحد الخسارة" }
@@ -1460,7 +1462,7 @@ class MainActivity : AppCompatActivity() {
                 background = shape(Color.parseColor("#0d1424"), 18, cCardStroke)
                 setPadding(dp(14), dp(10), dp(14), dp(10))
                 layoutParams = lp(MATCH, WRAP, 0, 0, 0, 8)
-                if (kind == "trade_open") {
+                if (kind.startsWith("trade_")) {
                     isClickable = true
                     pressable(this)
                     setOnClickListener { openMarketForAsset(asset, dir) }
@@ -1474,41 +1476,92 @@ class MainActivity : AppCompatActivity() {
 
     private val SELECT_ASSET_JS = """
 (function(raw){
+  var done=false;
+  function finish(ok){ if(done) return; done=true; try{ OscarBridge.onPair(ok); }catch(e){} }
   try {
-    var want = String(raw).replace(/_otc${'$'}/i,'').toUpperCase().replace(/[^A-Z0-9]/g,'');
-    var isOtc = /_otc${'$'}/i.test(raw);
+    var wantRaw=String(raw);
+    var isOtc=/_otc${'$'}/i.test(wantRaw);
+    var want=wantRaw.replace(/_otc${'$'}/i,'').toUpperCase().replace(/[^A-Z0-9]/g,'');
     function norm(t){ return String(t||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
     function vis(e){ var r=e.getBoundingClientRect(); return r.width>0 && r.height>0; }
-    function clk(e){ try{ e.scrollIntoView({block:'center'}); }catch(x){} e.click(); }
-    var opener = document.querySelector('[class*="asset-select"],[class*="current-asset"],[class*="assets-select"]');
-    if (opener && vis(opener)) clk(opener);
+    function fire(e){
+      try{ e.scrollIntoView({block:'center'}); }catch(x){}
+      ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
+        try{ e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window})); }catch(x){}
+      });
+    }
+    function findItem(){
+      var nodes=document.querySelectorAll('li,div,span,a,button');
+      var best=null, bestLen=1e9;
+      for(var i=0;i<nodes.length;i++){
+        var e=nodes[i]; if(!vis(e)) continue;
+        var t=norm(e.innerText); if(!t || t.indexOf(want)<0) continue;
+        var hasOtc=t.indexOf('OTC')>=0; if(isOtc!==hasOtc) continue;
+        if(t.length<bestLen && t.length<=want.length+22){ best=e; bestLen=t.length; }
+      }
+      return best;
+    }
+    var it=findItem();
+    if(it){ fire(it); finish(true); return; }
+    var openers=document.querySelectorAll('[class*="asset-select"],[class*="current-asset"],[class*="assets-select"],[class*="asset__"],[class*="Asset"]');
+    for(var i=0;i<openers.length;i++){ if(vis(openers[i])){ fire(openers[i]); break; } }
     setTimeout(function(){
-      var inp = document.querySelector('input[type="search"],input[class*="search"],input[placeholder*="earch"]');
-      if (inp) { inp.focus(); inp.value = want; inp.dispatchEvent(new Event('input',{bubbles:true})); }
-      setTimeout(function(){
-        var nodes = document.querySelectorAll('li,div,span,button,a');
-        for (var i=0;i<nodes.length;i++){
-          var e=nodes[i], t=norm(e.innerText);
-          if (t.indexOf(want)===0 && t.length < want.length+14 && vis(e)) {
-            if (isOtc && t.indexOf('OTC')<0) continue;
-            if (!isOtc && t.indexOf('OTC')>=0) continue;
-            clk(e); break;
-          }
-        }
-      },700);
-    },600);
-  } catch(e) {}
+      var inp=document.querySelector('input[type="search"],input[class*="search"],input[placeholder*="earch"],input[placeholder*="بحث"]');
+      if(inp){
+        inp.focus();
+        var setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+        setter.call(inp,want); inp.dispatchEvent(new Event('input',{bubbles:true}));
+      }
+      setTimeout(function(){ var it2=findItem(); if(it2){ fire(it2); finish(true); } else { finish(false); } }, 900);
+    }, 700);
+  } catch(e) { finish(false); }
 })(__ASSET__);
 """.trimIndent()
 
+    // لقطة تشخيص: تجمع وصف العناصر التي تحمل اسم الزوج لتساعد في ضبط الاختيار التلقائي
+    private val PAIR_DEBUG_JS = """
+(function(raw){
+  try {
+    var want=String(raw).replace(/_otc${'$'}/i,'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    var out=[];
+    var nodes=document.querySelectorAll('li,div,span,a,button,input');
+    for(var i=0;i<nodes.length && out.length<14;i++){
+      var e=nodes[i]; var t=(e.innerText||e.placeholder||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+      if(t && t.indexOf(want)>=0 && t.length<=want.length+24){
+        out.push(e.tagName+'.'+String(e.className).slice(0,80)+' | '+(e.innerText||'').replace(/\s+/g,' ').slice(0,40));
+      }
+    }
+    var inputs=document.querySelectorAll('input');
+    for(var j=0;j<inputs.length && j<6;j++){ out.push('INPUT.'+String(inputs[j].className).slice(0,60)+' ph='+inputs[j].placeholder); }
+    OscarBridge.onPairDebug(out.join('\n'));
+  } catch(e) { OscarBridge.onPairDebug('error '+e); }
+})(__ASSET__);
+""".trimIndent()
+
+    private fun runPairSelect() {
+        if (pairDone || pairAsset.isEmpty() || currentTab != "market") return
+        pairTries++
+        webView.evaluateJavascript(SELECT_ASSET_JS.replace("__ASSET__", JSONObject.quote(pairAsset)), null)
+        if (pairTries < 4) {
+            Handler(Looper.getMainLooper()).postDelayed({ runPairSelect() }, 3500)
+        } else if (!pairDone) {
+            pairChip.text = "⚠️ اختر الزوج يدوياً: " + prettyAsset(pairAsset) + "   (اضغط مطولاً للتشخيص)"
+        }
+    }
+
     private fun openMarketForAsset(asset: String, dir: String) {
         showMarket()
-        pairChip.text = "📌 الزوج: " + prettyAsset(asset) + (if (dir.isNotEmpty()) " · " + dirAr(dir) else "") + "   ✕"
+        pairAsset = asset
+        pairTries = 0
+        pairDone = false
+        pairChip.text = "📌 جارٍ فتح الزوج: " + prettyAsset(asset) + (if (dir.isNotEmpty()) " · " + dirAr(dir) else "") + " ..."
         pairChip.visibility = View.VISIBLE
-        val js = SELECT_ASSET_JS.replace("__ASSET__", JSONObject.quote(asset))
-        Handler(Looper.getMainLooper()).postDelayed({
-            if (currentTab == "market") webView.evaluateJavascript(js, null)
-        }, 2200)
+        pairChip.setOnClickListener { pairChip.visibility = View.GONE }
+        pairChip.setOnLongClickListener {
+            webView.evaluateJavascript(PAIR_DEBUG_JS.replace("__ASSET__", JSONObject.quote(pairAsset)), null)
+            true
+        }
+        Handler(Looper.getMainLooper()).postDelayed({ runPairSelect() }, 2000)
     }
 
     private fun showNotificationSettings() {
@@ -1552,6 +1605,15 @@ class MainActivity : AppCompatActivity() {
         test("تجربة: ربح") { sound.win() }
         test("تجربة: خسارة") { sound.loss() }
         box.addView(tests)
+        box.addView(roundButton("🔋 السماح بالعمل في الخلفية", cChip, cText, 12f).apply {
+            layoutParams = lp(MATCH, WRAP, 0, 12, 0, 0)
+            setOnClickListener {
+                try { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) } catch (e: Exception) {}
+            }
+        })
+        box.addView(text("لتصلك الإشعارات والأصوات والتطبيق مغلق: اسمح للتطبيق بالعمل في الخلفية بدون تقييد البطارية.", 11f, cMuted).apply {
+            setPadding(0, dp(6), 0, 0)
+        })
         AlertDialog.Builder(this)
             .setTitle("🔔 إعدادات الإشعارات والأصوات")
             .setView(box)
@@ -1630,6 +1692,7 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 if (url.contains("quotex.com")) view.evaluateJavascript(EARLY_HOOK_JS, null)
+                checkLoggedOut(url)
             }
         }
     }
@@ -1660,6 +1723,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     inner class Bridge {
+        @JavascriptInterface
+        fun onPair(ok: Boolean) {
+            runOnUiThread {
+                if (ok) {
+                    pairDone = true
+                    pairChip.text = "✅ تم فتح الزوج: " + prettyAsset(pairAsset)
+                    Handler(Looper.getMainLooper()).postDelayed({ pairChip.visibility = View.GONE }, 4000)
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun onPairDebug(info: String) {
+            runOnUiThread {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("oscar-debug", info))
+                Toast.makeText(this@MainActivity, "تم نسخ بيانات التشخيص، الصقها وأرسلها للمطوّر", Toast.LENGTH_LONG).show()
+            }
+        }
+
         @JavascriptInterface
         fun onSsid(ssid: String) {
             if (ssid.length < 25) return
