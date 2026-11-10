@@ -1437,22 +1437,24 @@ class MainActivity : AppCompatActivity() {
             val line1: String
             val line2: String
             val amt = ev.optDouble("amount", 0.0)
+            val balNote = ev.optString("note", "").toDoubleOrNull()
+            val balTxt = if (balNote != null) " • الرصيد: " + fmt(balNote) + "\$" else ""
             when (kind) {
                 "trade_open" -> {
                     line1 = "تم تنفيذ صفقة على " + prettyAsset(asset) + " " + dirAr(dir)
-                    line2 = "باستراتيجية: " + ev.optString("strategy_name") + " • مبلغ " + fmt(amt) + "\$ • اضغط للفتح في السوق"
+                    line2 = "باستراتيجية: " + ev.optString("strategy_name") + " • مبلغ " + fmt(amt) + "\$" + balTxt + " • اضغط للفتح في السوق"
                 }
                 "trade_win" -> {
                     line1 = "✅ ربحت صفقة " + prettyAsset(asset)
-                    line2 = (if (amt > 0) "ربح +" + fmt(amt) + "\$ • " else "") + ev.optString("strategy_name")
+                    line2 = (if (amt > 0) "ربح +" + fmt(amt) + "\$ • " else "") + ev.optString("strategy_name") + balTxt
                 }
                 "trade_loss" -> {
                     line1 = "❌ خسرت صفقة " + prettyAsset(asset)
-                    line2 = "خسارة " + fmt(Math.abs(amt)) + "\$ • " + ev.optString("strategy_name")
+                    line2 = "خسارة " + fmt(Math.abs(amt)) + "\$ • " + ev.optString("strategy_name") + balTxt
                 }
                 "trade_draw" -> {
                     line1 = "➖ تعادل في صفقة " + prettyAsset(asset)
-                    line2 = "استُرد المبلغ • " + ev.optString("strategy_name")
+                    line2 = "استُرد المبلغ • " + ev.optString("strategy_name") + balTxt
                 }
                 "session_win" -> { line1 = "🎉 انتهت الجلسة بربح"; line2 = "وصلت لحد الربح" }
                 else -> { line1 = "⚠️ انتهت الجلسة بخسارة"; line2 = "وصلت لحد الخسارة" }
@@ -1474,6 +1476,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // الاختيار يعتمد على علامات ثابتة في صفحة Quotex (وليس على أسماء الأصناف المتغيرة):
+    //   زر «+» = أيقونة icon-plus، نافذة الأزواج = العنوان «اختر زوج التداول»، واسم الزوج نص مطابق تماماً.
     private val SELECT_ASSET_JS = """
 (function(raw){
   var done=false;
@@ -1481,58 +1485,128 @@ class MainActivity : AppCompatActivity() {
   try {
     var wantRaw=String(raw);
     var isOtc=/_otc${'$'}/i.test(wantRaw);
-    var want=wantRaw.replace(/_otc${'$'}/i,'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    var base=wantRaw.replace(/_otc${'$'}/i,'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    var target=base+(isOtc?'OTC':'');
+    var disp=(base.length===6 ? base.slice(0,3)+'/'+base.slice(3) : base);
     function norm(t){ return String(t||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
-    function vis(e){ var r=e.getBoundingClientRect(); return r.width>0 && r.height>0; }
-    function fire(e){
+    function vis(e){ var r=e.getBoundingClientRect(); return r.width>2 && r.height>2 && r.bottom>0 && r.right>0; }
+    function press(e){
       try{ e.scrollIntoView({block:'center'}); }catch(x){}
-      ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
+      ['pointerdown','mousedown','pointerup','mouseup'].forEach(function(t){
         try{ e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window})); }catch(x){}
       });
+      try{ e.click(); }catch(x){}
     }
-    function findItem(){
-      var nodes=document.querySelectorAll('li,div,span,a,button');
-      var best=null, bestLen=1e9;
+    function modalOpen(){
+      var els=document.querySelectorAll('div,span,h1,h2,h3');
+      for(var i=0;i<els.length;i++){
+        if((els[i].textContent||'').trim()==='اختر زوج التداول' && vis(els[i])) return true;
+      }
+      return false;
+    }
+    function plusButton(){
+      var uses=document.querySelectorAll('use');
+      for(var i=0;i<uses.length;i++){
+        var h=(uses[i].getAttribute('href')||uses[i].getAttribute('xlink:href')||'');
+        if(h.indexOf('icon-plus')>=0){
+          var b=(uses[i].closest && uses[i].closest('button')) || uses[i].parentElement;
+          if(b && vis(b)) return b;
+        }
+      }
+      return null;
+    }
+    function hits(){
+      var out=[], nodes=document.querySelectorAll('span,div,a,li,p');
       for(var i=0;i<nodes.length;i++){
         var e=nodes[i]; if(!vis(e)) continue;
-        var t=norm(e.innerText); if(!t || t.indexOf(want)<0) continue;
-        var hasOtc=t.indexOf('OTC')>=0; if(isOtc!==hasOtc) continue;
-        if(t.length<bestLen && t.length<=want.length+22){ best=e; bestLen=t.length; }
+        var t=e.textContent; if(!t || t.length>40 || norm(t)!==target) continue;
+        var inner=false, kids=e.children;
+        for(var k=0;k<kids.length;k++){ if(norm(kids[k].textContent)===target){ inner=true; break; } }
+        if(!inner) out.push(e);
       }
-      return best;
+      return out;
     }
-    var it=findItem();
-    if(it){ fire(it); finish(true); return; }
-    var openers=document.querySelectorAll('[class*="asset-select"],[class*="current-asset"],[class*="assets-select"],[class*="asset__"],[class*="Asset"]');
-    for(var i=0;i<openers.length;i++){ if(vis(openers[i])){ fire(openers[i]); break; } }
-    setTimeout(function(){
-      var inp=document.querySelector('input[type="search"],input[class*="search"],input[placeholder*="earch"],input[placeholder*="بحث"]');
+    function rowOf(e){
+      var cur=e;
+      for(var i=0;i<7 && cur.parentElement;i++){
+        if(cur.parentElement.children.length>=15) return cur;
+        cur=cur.parentElement;
+      }
+      return e;
+    }
+    function pick(){
+      var h=hits();
+      if(!h.length) return false;
+      press(h[0]);
+      setTimeout(function(){
+        if(modalOpen()){
+          press(rowOf(h[0]));
+          setTimeout(function(){ finish(!modalOpen()); },900);
+        } else { finish(true); }
+      },700);
+      return true;
+    }
+    function afterOpen(){
+      if(!modalOpen()){ finish(false); return; }
+      var inp=document.querySelector('input[placeholder="بحث"]');
+      if(!inp){ var ins=document.querySelectorAll('input[type="text"]'); for(var i=0;i<ins.length;i++){ if(vis(ins[i])){ inp=ins[i]; break; } } }
       if(inp){
         inp.focus();
         var setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
-        setter.call(inp,want); inp.dispatchEvent(new Event('input',{bubbles:true}));
+        setter.call(inp,disp); inp.dispatchEvent(new Event('input',{bubbles:true}));
       }
-      setTimeout(function(){ var it2=findItem(); if(it2){ fire(it2); finish(true); } else { finish(false); } }, 900);
-    }, 700);
+      setTimeout(function(){ if(!pick()) finish(false); }, 800);
+    }
+    if(modalOpen()){ afterOpen(); return; }
+    var plus=plusButton();
+    if(plus){ press(plus); }
+    else {
+      // احتياط: عنصر الزوج الحالي في أعلى الصفحة
+      var nodes=document.querySelectorAll('span,div,a,button'), best=null;
+      for(var i=0;i<nodes.length;i++){
+        var e=nodes[i]; if(!vis(e)) continue;
+        var t=(e.textContent||'').trim(); if(!t || t.length>40 || !/[A-Z]{3}\/[A-Z]{3}/.test(t)) continue;
+        var r=e.getBoundingClientRect(); if(r.top>window.innerHeight*0.3) continue;
+        if(!best || t.length<(best.textContent||'').trim().length) best=e;
+      }
+      if(best) press(best);
+    }
+    setTimeout(afterOpen, 1000);
   } catch(e) { finish(false); }
 })(__ASSET__);
 """.trimIndent()
 
-    // لقطة تشخيص: تجمع وصف العناصر التي تحمل اسم الزوج لتساعد في ضبط الاختيار التلقائي
+    // لقطة تشخيص: تصف الأزرار والأيقونات ونافذة الأزواج وعناصر اسم الزوج لضبط الاختيار التلقائي
     private val PAIR_DEBUG_JS = """
 (function(raw){
   try {
-    var want=String(raw).replace(/_otc${'$'}/i,'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    function vis(e){ var r=e.getBoundingClientRect(); return r.width>2 && r.height>2; }
+    function norm(t){ return String(t||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
+    var wantRaw=String(raw);
+    var target=wantRaw.replace(/_otc${'$'}/i,'').toUpperCase().replace(/[^A-Z0-9]/g,'')+(/_otc${'$'}/i.test(wantRaw)?'OTC':'');
     var out=[];
-    var nodes=document.querySelectorAll('li,div,span,a,button,input');
-    for(var i=0;i<nodes.length && out.length<14;i++){
-      var e=nodes[i]; var t=(e.innerText||e.placeholder||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
-      if(t && t.indexOf(want)>=0 && t.length<=want.length+24){
-        out.push(e.tagName+'.'+String(e.className).slice(0,80)+' | '+(e.innerText||'').replace(/\s+/g,' ').slice(0,40));
+    out.push('URL '+location.pathname+'  W='+window.innerWidth+' H='+window.innerHeight);
+    var btns=document.querySelectorAll('button,[role="button"]');
+    for(var i=0;i<btns.length && out.length<30;i++){
+      var b=btns[i]; if(!vis(b)) continue;
+      var u=b.querySelector('use'); var ic=u?(u.getAttribute('href')||u.getAttribute('xlink:href')||''):'';
+      var r=b.getBoundingClientRect();
+      out.push('BTN '+String(b.className).slice(0,30)+' icon='+ic.split('#').pop()+' aria='+(b.getAttribute('aria-label')||'')+' ['+Math.round(r.left)+','+Math.round(r.top)+' '+Math.round(r.width)+'x'+Math.round(r.height)+'] '+(b.textContent||'').trim().slice(0,20));
+    }
+    var modal=false, all=document.querySelectorAll('div,span');
+    for(var j=0;j<all.length;j++){ if((all[j].textContent||'').trim()==='اختر زوج التداول' && vis(all[j])) modal=true; }
+    out.push('MODAL_OPEN='+modal);
+    var inputs=document.querySelectorAll('input');
+    for(var k=0;k<inputs.length && k<5;k++){ out.push('INPUT '+String(inputs[k].className).slice(0,30)+' ph='+inputs[k].placeholder+' vis='+vis(inputs[k])); }
+    var n=0, nodes=document.querySelectorAll('span,div,a,li');
+    for(var m=0;m<nodes.length && n<6;m++){
+      var e=nodes[m]; var t=e.textContent||'';
+      if(t.length<=40 && norm(t)===target){
+        var r2=e.getBoundingClientRect(); var p=e.parentElement;
+        out.push('PAIR '+e.tagName+'.'+String(e.className).slice(0,20)+' < '+(p?p.tagName+'.'+String(p.className).slice(0,20):'')+' vis='+vis(e)+' ['+Math.round(r2.left)+','+Math.round(r2.top)+']');
+        n++;
       }
     }
-    var inputs=document.querySelectorAll('input');
-    for(var j=0;j<inputs.length && j<6;j++){ out.push('INPUT.'+String(inputs[j].className).slice(0,60)+' ph='+inputs[j].placeholder); }
     OscarBridge.onPairDebug(out.join('\n'));
   } catch(e) { OscarBridge.onPairDebug('error '+e); }
 })(__ASSET__);
@@ -1542,12 +1616,14 @@ class MainActivity : AppCompatActivity() {
         if (pairDone || pairAsset.isEmpty() || currentTab != "market") return
         pairTries++
         webView.evaluateJavascript(SELECT_ASSET_JS.replace("__ASSET__", JSONObject.quote(pairAsset)), null)
-        if (pairTries < 4) {
+        if (pairTries < 6) {
             Handler(Looper.getMainLooper()).postDelayed({ runPairSelect() }, 3500)
         } else if (!pairDone) {
             pairChip.text = "⚠️ اختر الزوج يدوياً: " + prettyAsset(pairAsset) + "   (اضغط مطولاً للتشخيص)"
         }
     }
+
+    private var pairWaitLoad = false
 
     private fun openMarketForAsset(asset: String, dir: String) {
         showMarket()
@@ -1561,7 +1637,12 @@ class MainActivity : AppCompatActivity() {
             webView.evaluateJavascript(PAIR_DEBUG_JS.replace("__ASSET__", JSONObject.quote(pairAsset)), null)
             true
         }
-        Handler(Looper.getMainLooper()).postDelayed({ runPairSelect() }, 2000)
+        // نعيد تحميل صفحة التداول حتى نخرج من أي لوحة مفتوحة (مثل سجل الصفقات) ثم نختار الزوج
+        pairWaitLoad = true
+        webView.loadUrl("$QX_DOMAIN/ar/trade")
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (pairWaitLoad) { pairWaitLoad = false; runPairSelect() }
+        }, 15000)
     }
 
     private fun showNotificationSettings() {
@@ -1693,6 +1774,10 @@ class MainActivity : AppCompatActivity() {
                 super.onPageFinished(view, url)
                 if (url.contains("quotex.com")) view.evaluateJavascript(EARLY_HOOK_JS, null)
                 checkLoggedOut(url)
+                if (pairWaitLoad && url.contains("/trade")) {
+                    pairWaitLoad = false
+                    Handler(Looper.getMainLooper()).postDelayed({ runPairSelect() }, 3500)
+                }
             }
         }
     }
